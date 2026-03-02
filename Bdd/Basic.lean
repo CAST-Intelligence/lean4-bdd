@@ -787,7 +787,8 @@ lemma OBdd.evaluate_low_eq_evaluate_set_false {n m} {O : OBdd n m} {j : Fin m} {
 lemma OBdd.evaluate_high_eq_of_evaluate_eq_and_var_eq' {n m m' : Nat} {O : OBdd n m} {U : OBdd n m'} {j : Fin m} {i : Fin m'} {ho : O.1.root = node j} {hu : U.1.root = node i} :
     O.evaluate = U.evaluate → O.1.heap[j].var = U.1.heap[i].var → (O.high ho).evaluate = (U.high hu).evaluate := by
   intro h eq
-  rw [evaluate_high_eq_evaluate_set_true, h, eq ,← evaluate_high_eq_evaluate_set_true]
+  ext I
+  simp only [evaluate_high_eq_evaluate_set_true, Function.comp_apply, h, eq]
 
 lemma OBdd.evaluate_high_eq_of_evaluate_eq_and_var_eq {n m} {O U : OBdd n m} {j i : Fin m} {ho : O.1.root = node j} {hu : U.1.root = node i} :
     O.evaluate = U.evaluate → O.1.heap[j].var = U.1.heap[i].var → (O.high ho).evaluate = (U.high hu).evaluate := evaluate_high_eq_of_evaluate_eq_and_var_eq'
@@ -795,7 +796,8 @@ lemma OBdd.evaluate_high_eq_of_evaluate_eq_and_var_eq {n m} {O U : OBdd n m} {j 
 lemma OBdd.evaluate_low_eq_of_evaluate_eq_and_var_eq' {n m m' : Nat} {O : OBdd n m} {U : OBdd n m'} {j : Fin m} {i : Fin m'} {ho : O.1.root = node j} {hu : U.1.root = node i} :
   O.evaluate = U.evaluate → O.1.heap[j].var = U.1.heap[i].var → (O.low ho).evaluate = (U.low hu).evaluate := by
   intro h eq
-  rw [evaluate_low_eq_evaluate_set_false, h, eq ,← evaluate_low_eq_evaluate_set_false]
+  ext I
+  simp only [evaluate_low_eq_evaluate_set_false, Function.comp_apply, h, eq]
 
 lemma OBdd.evaluate_low_eq_of_evaluate_eq_and_var_eq {n m} {O U : OBdd n m} {j i : Fin m} {ho : O.1.root = node j} {hu : U.1.root = node i} :
   O.evaluate = U.evaluate → O.1.heap[j].var = U.1.heap[i].var → (O.low ho).evaluate = (U.low hu).evaluate := evaluate_low_eq_of_evaluate_eq_and_var_eq'
@@ -1468,7 +1470,7 @@ lemma OBdd.dependsOn_of_usesVar_of_reduced {O : OBdd n m} :
   | refl =>
     rw [← O_def]
     rw [evaluate_node'' (by rw [O_def])]
-    rw [show O.1.heap = heap by rw [O_def], hi]
+    simp_rw [show O.1.heap = heap from by rw [O_def], hi]
     simp only [Fin.getElem_fin, Vector.getElem_set_self, ↓reduceIte, ne_eq]
     rw [← not_forall]
     intro contra
