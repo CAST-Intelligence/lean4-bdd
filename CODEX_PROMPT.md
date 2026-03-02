@@ -182,8 +182,56 @@ discover_vlist_ok                -- discover produces VlistOK
    - Use a simulation argument (each step maintains eval equivalence)?
    - Factor through a "toTree equivalence" argument?
 
-## Repository
+## Project Setup
+
+This is a standalone Lean 4 project at `ai_docs/lean4-bdd/` within a larger repo.
+Work exclusively in this directory.
+
+```
+ai_docs/lean4-bdd/
+  lakefile.toml          # Lake project config
+  lean-toolchain         # leanprover/lean4:v4.28.0
+  Bdd/
+    Basic.lean           # BDD types: Pointer, Node, Bdd, Edge, Reachable
+    BddTree.lean         # Tree type, OBdd.toTree
+    Ordered.lean         # Bdd.Ordered, OBdd, ordered_of_reachable
+    Reduced.lean         # OBdd.Reduced (NoRedundancy + SimilarRP injectivity)
+    Evaluate.lean        # OBdd.evaluate (Shannon expansion)
+    Collect.lean         # collect: reachable node enumeration
+    Trim.lean            # otrim: trim unreachable nodes
+    Reduce.lean          # THE TARGET FILE (Bryant reduction + proofs, ~2670 lines)
+```
+
+### Build
+
+```bash
+cd ai_docs/lean4-bdd
+lake build              # builds all (depends on mathlib v4.28.0)
+```
+
+Mathlib is a dependency (for List.mergeSort, Vector, etc). First build fetches it.
+
+### Verify sorry count
+
+```bash
+grep -n 'sorry' Bdd/Reduce.lean
+```
+
+Should show 6 lines.
+
+## Branch & Commit
 
 Branch: `lean-4.28-compat`, commit: `d006568`
 File: `Bdd/Reduce.lean`
 Lean toolchain: `leanprover/lean4:v4.28.0`
+
+## Task
+
+Analyze the 6 sorry sites and propose concrete proof strategies. You may:
+- Write proof sketches (tactic-mode Lean 4)
+- Suggest new helper lemmas with signatures
+- Propose restructuring of invariants (especially for the budget bound)
+- Point out if any sorry is fundamentally unprovable as stated and needs restating
+
+Focus on actionable strategies rather than general advice. Reference line numbers and
+existing lemma names. If you write code, make sure it uses Lean 4 syntax (not Lean 3).
