@@ -921,8 +921,67 @@ private lemma populate_queue_acc_subset {n m : Nat}
         exact ih _ _ entry (List.mem_cons_of_mem _ hentry)
     )
 
--- For entries from populate_queue (with empty acc), each key pointer is either a terminal
--- or s.ids[c] for some c not in l. This relies on children disjointness.
+-- Auxiliary: entries from populate_queue have keys that are terminal or
+-- s₀.ids[c] for c not in l₀ (a fixed outer list). Using l₀ avoids losing
+-- information when recursing from j::tail to tail: c ∉ l₀ implies c ≠ j,
+-- so set_id at j in the redundant case does not affect relevant positions.
+private lemma populate_queue_entry_keys_aux {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ)
+    (acc : List ((Pointer m.succ × Pointer m.succ) × Fin m.succ))
+    (l : List (Fin m.succ))
+    (s s₀ : State n.succ m.succ)
+    (l₀ : List (Fin m.succ))
+    (hl_sub : l ⊆ l₀)
+    (hnodup : l.Nodup)
+    (hchildren : ∀ j ∈ l, ∀ c : Fin m.succ, (v[j].low = node c ∨ v[j].high = node c) → c ∉ l₀)
+    (hids_agree : ∀ c : Fin m.succ, c ∉ l₀ → s.ids[c] = s₀.ids[c])
+    (hacc : ∀ entry ∈ acc, ∀ ptr, (ptr = entry.1.1 ∨ ptr = entry.1.2) →
+      (∃ b, ptr = terminal b) ∨ (∃ c : Fin m.succ, c ∉ l₀ ∧ ptr = s₀.ids[c])) :
+    ∀ entry ∈ (StateT.run (populate_queue v acc l) s).1, ∀ ptr, (ptr = entry.1.1 ∨ ptr = entry.1.2) →
+      (∃ b, ptr = terminal b) ∨ (∃ c : Fin m.succ, c ∉ l₀ ∧ ptr = s₀.ids[c]) := by
+  induction l generalizing acc s with
+  | nil =>
+    intro entry hentry ptr hptr
+    simp [populate_queue, StateT.run, pure, StateT.pure] at hentry
+    exact hacc entry hentry ptr hptr
+  | cons j tail ih =>
+    have hnodup_tail : tail.Nodup := (List.nodup_cons.mp hnodup).2
+    have hj_in_l₀ : j ∈ l₀ := hl_sub (List.mem_cons_self ..)
+    have htail_sub : tail ⊆ l₀ := fun x hx => hl_sub (List.mem_cons_of_mem _ hx)
+    have hchildren_tail : ∀ j' ∈ tail, ∀ c : Fin m.succ,
+        (v[j'].low = node c ∨ v[j'].high = node c) → c ∉ l₀ :=
+      fun j' hj' c hc => hchildren j' (List.mem_cons_of_mem _ hj') c hc
+    intro entry hentry ptr hptr
+    rcases hlow : v[j].low with b1 | k1 <;> rcases hhigh : v[j].high with b2 | k2
+    all_goals (
+      unfold populate_queue at hentry
+      simp only [stateT_run_bind, get_id_run, hlow, hhigh] at hentry
+      split at hentry
+      · -- redundant: set_id j lid, recurse with same acc but modified state
+        simp only [stateT_run_bind, set_id_run'] at hentry
+        -- For c ∉ l₀: c ≠ j (since j ∈ l₀), so ids.set j _ does not affect position c
+        refine ih _ _ htail_sub hnodup_tail hchildren_tail ?_ hacc entry hentry ptr hptr
+        intro c hc
+        have hcj : c ≠ j := fun h => hc (h ▸ hj_in_l₀)
+        simp only [Fin.getElem_fin]
+        rw [Vector.getElem_set_ne _ _ (Fin.val_ne_of_ne hcj).symm]
+        exact hids_agree c hc
+      · -- non-redundant: extend acc with new entry, state unchanged
+        refine ih _ _ htail_sub hnodup_tail hchildren_tail hids_agree ?_ entry hentry ptr hptr
+        intro e he p hp
+        rcases List.mem_cons.mp he with rfl | he'
+        · rcases hp with rfl | rfl <;> simp only [Prod.fst, Prod.snd]
+          all_goals first
+            | exact Or.inl ⟨_, rfl⟩
+            | (right; exact ⟨_, hchildren j (List.mem_cons_self ..) _
+                (by first | exact Or.inl hlow | exact Or.inr hhigh),
+                hids_agree _ (hchildren j (List.mem_cons_self ..) _
+                (by first | exact Or.inl hlow | exact Or.inr hhigh))⟩)
+        · exact hacc e he' p hp
+    )
+
+-- Wrapper: entries from populate_queue have keys that are terminal or
+-- s.ids[c] for c not in l.
 private lemma populate_queue_entry_keys {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (acc : List ((Pointer m.succ × Pointer m.succ) × Fin m.succ))
@@ -933,107 +992,9 @@ private lemma populate_queue_entry_keys {n m : Nat}
     (hacc : ∀ entry ∈ acc, ∀ ptr, (ptr = entry.1.1 ∨ ptr = entry.1.2) →
       (∃ b, ptr = terminal b) ∨ (∃ c : Fin m.succ, c ∉ l ∧ ptr = s.ids[c])) :
     ∀ entry ∈ (StateT.run (populate_queue v acc l) s).1, ∀ ptr, (ptr = entry.1.1 ∨ ptr = entry.1.2) →
-      (∃ b, ptr = terminal b) ∨ (∃ c : Fin m.succ, c ∉ l ∧ ptr = s.ids[c]) := by
-  induction l generalizing acc s with
-  | nil =>
-    intro entry hentry ptr hptr
-    simp [populate_queue, StateT.run, pure, StateT.pure] at hentry
-    exact hacc entry hentry ptr hptr
-  | cons j tail ih =>
-    have hnodup_tail : tail.Nodup := (List.nodup_cons.mp hnodup).2
-    have hj_notin : j ∉ tail := (List.nodup_cons.mp hnodup).1
-    have hchildren_tail : ∀ j' ∈ tail, ∀ c : Fin m.succ,
-        (v[j'].low = node c ∨ v[j'].high = node c) → c ∉ tail := by
-      intro j' hj' c hc habs
-      exact hchildren j' (List.mem_cons_of_mem _ hj') c hc (List.mem_cons_of_mem _ habs)
-    intro entry hentry ptr hptr
-    rcases hlow : v[j].low with b1 | k1 <;> rcases hhigh : v[j].high with b2 | k2
-    all_goals (
-      unfold populate_queue at hentry
-      simp only [stateT_run_bind, get_id_run, hlow, hhigh] at hentry
-      split at hentry
-      · -- redundant: set_id j lid, recurse with same acc but modified state
-        simp only [stateT_run_bind, set_id_run'] at hentry
-        -- The modified state sets ids[j] = lid. For acc entries, c ≠ j so
-        -- s_modified.ids[c] = s.ids[c]. For new entries from tail, c ∉ tail and c ≠ j
-        -- (from children disjointness), so c ∉ j :: tail.
-        have hacc_tail : ∀ e ∈ acc, ∀ p, (p = e.1.1 ∨ p = e.1.2) →
-            (∃ b, p = terminal b) ∨ (∃ c : Fin m.succ, c ∉ tail ∧
-              p = (⟨s.out, s.ids.set j _, s.nid⟩ : State n.succ m.succ).ids[c]) := by
-          intro e he p hp
-          rcases hacc e he p hp with ⟨b, hb⟩ | ⟨c, hc_notin, hc_eq⟩
-          · exact Or.inl ⟨b, hb⟩
-          · right; refine ⟨c, fun hc_tail => hc_notin (List.mem_cons_of_mem _ hc_tail), ?_⟩
-            simp only [Fin.getElem_fin]; rw [hc_eq]
-            have hcj : c ≠ j := fun h => hc_notin (h ▸ List.mem_cons_self ..)
-            exact (Vector.getElem_set_ne _ _ (Fin.val_ne_of_ne hcj).symm).symm
-        have key := ih _ _ hnodup_tail hchildren_tail hacc_tail entry hentry ptr hptr
-        rcases key with ⟨b, hb⟩ | ⟨c, hc_notin, hc_eq⟩
-        · exact Or.inl ⟨b, hb⟩
-        · right
-          refine ⟨c, fun hc_mem => ?_, ?_⟩
-          · rcases List.mem_cons.mp hc_mem with rfl | hc_tail
-            · -- c = j: but ih gave us ptr = s_modified.ids[j] = lid
-              -- s_modified.ids[j] = set_self, which was set to lid (the low child)
-              -- We need to show j ∉ tail, which we have as hj_notin. Contradiction: hc_notin says c ∉ tail, but c = j and j ∉ tail, so no contradiction. Instead, check s_modified.ids[j].
-              -- Actually, c ∉ tail from ih, and c = j, so this should be fine: c ∉ tail is true since j ∉ tail.
-              exact absurd hc_notin (by simp [hj_notin]; exact fun h => absurd h hc_notin)
-            · exact hc_notin hc_tail
-          · simp only [Fin.getElem_fin] at hc_eq ⊢; rw [hc_eq]
-            have hcj : c ≠ j := by
-              intro h; subst h
-              -- c = j: s_modified.ids[j] = set_self = lid
-              -- ptr = s_modified.ids[j] = lid (set to low child)
-              -- But we also need ptr = s.ids[c] = s.ids[j]
-              -- s_modified.ids[j] ≠ s.ids[j] in general. So c = j leads to:
-              -- We need ptr = s.ids[j], but ptr = s_modified.ids[j] (which is lid, not necessarily s.ids[j]).
-              -- This is only a problem if c = j shows up in ih's result.
-              -- Since j ∉ tail and ih is about entries from populate_queue over tail,
-              -- any c from ih satisfies c ∉ tail. If c = j, then j ∉ tail, which is fine.
-              -- But the goal requires ptr = s.ids[j], while hc_eq says ptr = s_modified.ids[j].
-              -- These differ! So c = j is actually impossible here: populate_queue over tail
-              -- with modified state produces entries whose children reference s_modified.ids[c],
-              -- and s_modified.ids[j] = lid (terminal or s.ids[_]).
-              -- Actually, the entries from populate_queue are for nodes in tail.
-              -- Their children are resolve_id(s_modified, v[j'].low/high) for j' in tail.
-              -- Children of j' ∈ tail are not in tail (by hchildren_tail), so c ∉ tail.
-              -- If c = j, then c ∉ tail (since j ∉ tail), and
-              -- ptr = s_modified.ids[j] = Vector.getElem_set_self = (the value set)
-              -- which is lid. For lid: if terminal, it's covered by the terminal case.
-              -- If lid = s.ids[k1], then the ih would have found c = k1, not c = j.
-              -- So c = j shouldn't arise. But proving this cleanly is complex.
-              sorry
-            exact (Vector.getElem_set_ne _ _ (Fin.val_ne_of_ne hcj)).symm
-      · -- non-redundant: recurse with extended acc
-        have hacc' : ∀ e ∈ (⟨⟨_, _⟩, j⟩ :: acc), ∀ p, (p = e.1.1 ∨ p = e.1.2) →
-            (∃ b, p = terminal b) ∨ (∃ c : Fin m.succ, c ∉ tail ∧ p = s.ids[c]) := by
-          intro e he p hp
-          rcases List.mem_cons.mp he with rfl | he'
-          · rcases hp with rfl | rfl <;> simp only [Prod.fst, Prod.snd]
-            all_goals first
-              | exact Or.inl ⟨_, rfl⟩
-              | (right; exact ⟨_, fun h => hchildren j (List.mem_cons_self ..) _
-                  (by first | exact Or.inl hlow | exact Or.inr hhigh | exact Or.inl hlow | exact Or.inr hhigh)
-                  (List.mem_cons_of_mem _ h), rfl⟩)
-          · rcases hacc e he' p hp with ⟨b, hb⟩ | ⟨c, hc_notin, hc_eq⟩
-            · exact Or.inl ⟨b, hb⟩
-            · right; exact ⟨c, fun hc_tail => hc_notin (List.mem_cons_of_mem _ hc_tail), hc_eq⟩
-        rcases ih _ _ hnodup_tail hchildren_tail hacc' entry hentry ptr hptr with ⟨b, hb⟩ | ⟨c, hc_notin, hc_eq⟩
-        · exact Or.inl ⟨b, hb⟩
-        · right
-          exact ⟨c, fun hc_mem => by
-            rcases List.mem_cons.mp hc_mem with rfl | hc_tail
-            · -- c = j: but children of j (in tail) cannot reference j (by hchildren)
-              -- Actually c ∉ tail from ih, and c = j, j ∉ tail, so both are consistent.
-              -- Need to show False. From children disjointness: the entry's .2 is some j' ∈ tail,
-              -- and if c = j with v[j'].low = node j or v[j'].high = node j, then hchildren says j ∉ j::tail,
-              -- but j ∈ j::tail. Contradiction.
-              -- But we don't directly have this info about which j' produced c.
-              -- This case actually CAN'T happen because children of tail nodes can't be j.
-              -- For now:
-              exact absurd (hj_notin) (by push_neg; exact hc_notin)
-            · exact hc_notin hc_tail, hc_eq⟩
-    )
+      (∃ b, ptr = terminal b) ∨ (∃ c : Fin m.succ, c ∉ l ∧ ptr = s.ids[c]) :=
+  populate_queue_entry_keys_aux v acc l s s l (List.Subset.refl _) hnodup hchildren
+    (fun _ _ => rfl) hacc
 
 -- When k is non-redundant and in l, populate_queue produces an entry with .2 = k.
 private lemma populate_queue_nonredundant_in_queue {n m : Nat}
