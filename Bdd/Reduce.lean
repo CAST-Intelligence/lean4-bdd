@@ -51,6 +51,97 @@ theorem OBdd.discover_spec {O : OBdd n m} {j : Fin m} :
     (Reachable O.1.heap O.1.root (node j)) → j ∈ (discover O).get O.1.heap[j].var :=
   (discover_helper_spec O) ∘ Collect.collect_spec
 
+-- discover_helper preserves: all elements in I[i] have v[j].var = i
+-- (and only adds elements where v[j].var matches the index)
+private lemma OBdd.discover_helper_var_preserved {n m : Nat}
+    (v : Vector (Node n m) m) (l : List (Fin m)) (I : Vector (List (Fin m)) n)
+    (hI : ∀ (i : Fin n) (j : Fin m), j ∈ I[i] → v[j].var = i) :
+    ∀ (i : Fin n) (j : Fin m), j ∈ (discover_helper l v I)[i] → v[j].var = i := by
+  induction l generalizing I with
+  | nil => simp [discover_helper]; exact hI
+  | cons head tail ih =>
+    apply ih
+    intro i j hmem
+    simp only [] at hmem
+    by_cases hvar : v[head].var = i
+    · subst hvar
+      simp only [Fin.getElem_fin, Vector.getElem_set_self] at hmem
+      cases hmem with
+      | head => rfl
+      | tail _ h => exact hI _ j h
+    · have hne : (v[head].var : Nat) ≠ (i : Nat) := Fin.val_ne_of_ne hvar
+      rw [show (I.set v[head].var (head :: I[v[head].var]))[i] = I[i] from
+        Vector.getElem_set_ne _ _ hne] at hmem
+      exact hI i j hmem
+
+-- All nodes in discover(O)[i] have variable index i
+theorem OBdd.discover_var_eq {O : OBdd n m} {i : Fin n} {j : Fin m}
+    (h : j ∈ (discover O)[i]) :
+    O.1.heap[j].var = i := by
+  unfold discover at h
+  exact discover_helper_var_preserved O.1.heap _ _ (by
+    intro i' j' hmem
+    have : (Vector.replicate n ([] : List (Fin m)))[i'.val] = [] :=
+      Vector.getElem_replicate i'.isLt
+    simp only [Fin.getElem_fin] at hmem
+    rw [this] at hmem
+    exact absurd hmem (List.not_mem_nil)) i j h
+
+-- discover_helper only contains elements from l or I
+private lemma OBdd.discover_helper_source {n m : Nat}
+    (v : Vector (Node n m) m) (l : List (Fin m)) (I : Vector (List (Fin m)) n) :
+    ∀ (i : Fin n) (j : Fin m), j ∈ (discover_helper l v I)[i] → j ∈ l ∨ j ∈ I[i] := by
+  induction l generalizing I with
+  | nil =>
+    intro i j h
+    simp [discover_helper] at h
+    exact Or.inr h
+  | cons head tail ih =>
+    intro i j hmem
+    rcases ih (I.set v[head].var (head :: I[v[head].var])) i j hmem with hl | hI
+    · exact Or.inl (List.mem_cons_of_mem _ hl)
+    · by_cases hvar : v[head].var = i
+      · subst hvar
+        simp only [Fin.getElem_fin, Vector.getElem_set_self] at hI
+        rcases List.mem_cons.mp hI with rfl | hI'
+        · exact Or.inl (List.mem_cons_self ..)
+        · exact Or.inr hI'
+      · have hne : (v[head].var : Nat) ≠ (i : Nat) := Fin.val_ne_of_ne hvar
+        rw [show (I.set v[head].var (head :: I[v[head].var]))[i] = I[i] from
+          Vector.getElem_set_ne _ _ hne] at hI
+        exact Or.inr hI
+
+-- All nodes in discover(O)[i] are reachable from the root
+theorem OBdd.discover_reachable {O : OBdd n m} {i : Fin n} {j : Fin m}
+    (h : j ∈ (discover O)[i]) :
+    Pointer.Reachable O.1.heap O.1.root (.node j) := by
+  unfold discover at h
+  rcases discover_helper_source O.1.heap (Collect.collect O) (Vector.replicate n []) i j h with hmem | hmem
+  · exact Collect.collect_spec_reverse hmem
+  · simp only [Fin.getElem_fin, Vector.getElem_replicate] at hmem
+    exact absurd hmem (List.not_mem_nil)
+
+-- Children of nodes in discover(O)[i] are NOT in discover(O)[i].
+-- This is because ordering requires v[k].var < v[c].var for an edge k->c,
+-- but all nodes in discover(O)[i] have v[j].var = i.
+theorem OBdd.child_not_in_discover {O : OBdd n m} {i : Fin n} {k c : Fin m}
+    (hk : k ∈ (discover O)[i])
+    (hedge : Edge O.1.heap (.node k) (.node c)) :
+    c ∉ (discover O)[i] := by
+  intro hc
+  have hk_var := discover_var_eq hk  -- v[k].var = i
+  have hc_var := discover_var_eq hc  -- v[c].var = i
+  have hk_reach := discover_reachable hk
+  have hc_reach : Pointer.Reachable O.1.heap O.1.root (.node c) := .tail hk_reach hedge
+  -- Ordering gives: toVar v (node k) < toVar v (node c), i.e., v[k].var < v[c].var
+  have hord : Pointer.MayPrecede O.1.heap (.node k) (.node c) :=
+    @O.2 ⟨.node k, hk_reach⟩ ⟨.node c, hc_reach⟩ hedge
+  simp only [Pointer.MayPrecede, Pointer.toVar] at hord
+  -- hord : v[k].var < v[c].var
+  -- hk_var : v[k].var = i, hc_var : v[c].var = i
+  rw [hk_var, hc_var] at hord
+  exact Nat.lt_irrefl _ hord
+
 namespace Reduce
 private structure State (n) (m) where
   out : Vector (Node n m) m
@@ -185,18 +276,37 @@ private structure StateOK {n m : Nat}
   /-- If ids[r] is non-terminal, nid has wrapped around (at least one write happened) -/
   nid_lt_m_of_nonterminal :
     (¬∃ b, s.ids[r] = terminal b) → s.nid.val < m
+  /-- If ANY id is non-terminal, nid < m. Generalizes nid_lt_m_of_nonterminal to arbitrary k. -/
+  nid_lt_m_of_any_nonterminal :
+    ∀ k : Fin m.succ, (¬∃ b, s.ids[k] = terminal b) → s.nid.val < m
+  /-- Global correctness: every non-terminal mapped id has a correct output BDD.
+      This strengthens the per-root tracking to enable the r-in-vlist proof,
+      where we need properties of children's mapped ids (processed at earlier levels). -/
+  global_ok :
+    ∀ k : Fin m.succ, (¬∃ b, s.ids[k] = terminal b) →
+      (Bdd.Ordered {heap := s.out, root := s.ids[k]} ∧
+       (∀ j : Fin m.succ, Pointer.Reachable s.out s.ids[k] (.node j) → j.val < s.nid.val + 1) ∧
+       (∀ hord : Bdd.Ordered {heap := s.out, root := s.ids[k]},
+          OBdd.Reduced ⟨{heap := s.out, root := s.ids[k]}, hord⟩))
 
 -- We prove loop_result_ok by mirroring the structure of loop.
 -- The key insight: in the base case, the result BDD is {heap := s'.out, root := s'.ids[r]}
 -- where s' is the state after running step. In the recursive case, we delegate to the
 -- induction hypothesis.
 
--- If ids[r] is a terminal, the StateOK invariant holds trivially
+-- If ids[r] is a terminal, the StateOK invariant holds trivially.
+-- The global_ok field must be provided externally since it depends on ALL ids, not just r's.
 private lemma stateOK_of_terminal_ids {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
     (s : State n.succ m.succ)
     (hord_input : Bdd.Ordered ⟨v, node r⟩)
-    (ht : ∃ b, s.ids[r] = terminal b) :
+    (ht : ∃ b, s.ids[r] = terminal b)
+    (hglob : ∀ k : Fin m.succ, (¬∃ b, s.ids[k] = terminal b) →
+      (Bdd.Ordered {heap := s.out, root := s.ids[k]} ∧
+       (∀ j : Fin m.succ, Pointer.Reachable s.out s.ids[k] (.node j) → j.val < s.nid.val + 1) ∧
+       (∀ hord : Bdd.Ordered {heap := s.out, root := s.ids[k]},
+          OBdd.Reduced ⟨{heap := s.out, root := s.ids[k]}, hord⟩)))
+    (hnid_any : ∀ k : Fin m.succ, (¬∃ b, s.ids[k] = terminal b) → s.nid.val < m) :
     StateOK v r s hord_input := by
   obtain ⟨b, hb⟩ := ht
   have hord : Bdd.Ordered {heap := s.out, root := s.ids[r]} := by
@@ -211,6 +321,8 @@ private lemma stateOK_of_terminal_ids {n m : Nat}
       exact OBdd.reduced_of_terminal this
     nid_lt_m_of_nonterminal := by
       intro hnt; exact absurd ⟨b, hb⟩ hnt
+    nid_lt_m_of_any_nonterminal := hnid_any
+    global_ok := hglob
   }
 
 -- get_id is a pure read operation - unfold helper
@@ -490,25 +602,6 @@ private lemma step_ids_not_in_vlist {n m : Nat}
   trans s₁.ids[r]
   · exact process_queue_ids_not_in_entries v _ _ r hne s₁
   · exact hpop
-
--- Key insight for the proof structure:
--- During the loop (recursive case where i.1 - v[r].var.1 > 0), we have i > v[r].var.
--- Step at level i only processes nodes with variable index i.
--- Since r has variable index v[r].var < i, step does not modify ids[r].
--- So if ids[r] was terminal before step, it's still terminal after.
--- At the base case (i = v[r].var), step DOES modify ids[r], and we need the full
--- correctness argument.
-
--- For the recursive case: step preserves StateOK when ids[r] stays terminal
-private lemma step_preserves_ok_terminal {n m : Nat}
-    (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
-    (vlist : Vector (List (Fin m.succ)) n.succ) (i : Fin n.succ)
-    (s : State n.succ m.succ)
-    (hord_input : Bdd.Ordered ⟨v, node r⟩)
-    (hok : StateOK v r s hord_input)
-    (ht : ∃ b, (StateT.run (step v vlist i) s).2.ids[r] = terminal b) :
-    StateOK v r (StateT.run (step v vlist i) s).2 hord_input :=
-  stateOK_of_terminal_ids v r _ hord_input ht
 
 -- The core step correctness: after step at level i, if ids[r] is non-terminal,
 -- the output BDD rooted at ids[r] is ordered, bounded, and reduced.
@@ -790,37 +883,6 @@ private lemma ordered_of_heap_agree_on_reachable {n m : Nat} (O : OBdd n.succ m.
         simp only [hj_eq, hk_eq]; exact h_mp
 termination_by O
 
-private lemma step_nonterminal_ordered {n m : Nat}
-    (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
-    (vlist : Vector (List (Fin m.succ)) n.succ) (i : Fin n.succ)
-    (s : State n.succ m.succ)
-    (hord_input : Bdd.Ordered ⟨v, node r⟩)
-    (hok : StateOK v r s hord_input)
-    (s' : State n.succ m.succ)
-    (hs' : s' = (StateT.run (step v vlist i) s).2)
-    (hnt : ¬∃ b, s'.ids[r] = terminal b) :
-    Bdd.Ordered {heap := s'.out, root := s'.ids[r]} := by
-  by_cases hr : r ∈ vlist[i]
-  · sorry -- r in vlist[i]: core Bryant correctness case
-  · have hids_eq : s'.ids[r] = s.ids[r] := by
-      rw [hs']; exact step_ids_not_in_vlist v vlist i r hr s
-    -- Transfer ordering from s.out to s'.out via heap agreement on reachable nodes
-    have hnid_lt : s.nid.val < m := hok.nid_lt_m_of_nonterminal (by rwa [hids_eq] at hnt)
-    have hagree : ∀ j : Fin m.succ, Pointer.Reachable s.out s.ids[r] (.node j) →
-        s'.out[j] = s.out[j] := by
-      intro k hk
-      have hle : k.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hok.bounded_at_root k hk)
-      have h := step_out_stable v vlist i s k hle hnid_lt
-      rw [hs']; exact h
-    -- Transfer ordering via ordered_of_heap_agree_on_reachable
-    have hord_transfer : Bdd.Ordered ⟨s'.out, s.ids[r]⟩ :=
-      ordered_of_heap_agree_on_reachable
-        ⟨⟨s.out, s.ids[r]⟩, hok.ordered_at_root⟩ s'.out hagree
-    -- Transport: RelevantEdge/MayPrecede only depend on heap, not root
-    rename_i xp yp
-    intro hedge
-    exact @hord_transfer ⟨xp.1, hids_eq ▸ xp.2⟩ ⟨yp.1, hids_eq ▸ yp.2⟩ hedge
-
 -- Helper: if heaps M and M' agree on all positions reachable from root in M,
 -- then anything reachable from root in M' is also reachable from root in M.
 private lemma reachable_of_heap_agree {n m : Nat}
@@ -922,6 +984,161 @@ private lemma toTree_eq_of_heap_agree {n m : Nat} (O : OBdd n m)
       exact ih_high
 termination_by O
 
+-- Helper: transfer ordered/bounded/reduced from one state to another via heap agreement.
+-- This factors out the common pattern used in both k∉vlist and redundant k∈vlist cases.
+-- Given a pointer p that is correct in state s (from global_ok), if the heap agrees on
+-- positions reachable from p, then p is correct in the new output heap with new nid bound.
+private lemma transfer_correctness_via_heap_agree {n m : Nat}
+    (s_out_old s_out_new : Vector (Node n.succ m.succ) m.succ)
+    (p : Pointer m.succ)
+    (nid_old nid_new : Fin m.succ)
+    (hord_old : Bdd.Ordered ⟨s_out_old, p⟩)
+    (hbnd_old : ∀ j : Fin m.succ, Pointer.Reachable s_out_old p (.node j) → j.val < nid_old.val + 1)
+    (hred_old : OBdd.Reduced ⟨⟨s_out_old, p⟩, hord_old⟩)
+    (hagree : ∀ j : Fin m.succ, Pointer.Reachable s_out_old p (.node j) →
+        s_out_new[j] = s_out_old[j])
+    (hnid_ge : nid_old.val ≤ nid_new.val) :
+    (Bdd.Ordered ⟨s_out_new, p⟩ ∧
+     (∀ j : Fin m.succ, Pointer.Reachable s_out_new p (.node j) → j.val < nid_new.val + 1) ∧
+     (∀ hord : Bdd.Ordered ⟨s_out_new, p⟩,
+        OBdd.Reduced ⟨⟨s_out_new, p⟩, hord⟩)) := by
+  constructor
+  · -- Ordered: transfer via heap agreement
+    exact ordered_of_heap_agree_on_reachable ⟨⟨s_out_old, p⟩, hord_old⟩ s_out_new hagree
+  constructor
+  · -- Bounded: transfer from old bounded + nid non-decreasing
+    intro j hj
+    have hj_old := reachable_of_heap_agree hagree hj
+    have := hbnd_old j hj_old
+    omega
+  · -- Reduced: transfer via heap agreement
+    intro hord'
+    constructor
+    · -- NoRedundancy
+      intro ⟨q, hq⟩
+      have hq_old := reachable_of_heap_agree hagree hq
+      cases q with
+      | terminal => exact fun h => nomatch h
+      | node j' =>
+        intro hred_j'
+        have hj'_eq : s_out_new[j'] = s_out_old[j'] := hagree j' hq_old
+        have hred_old_j' : Pointer.Redundant s_out_old (.node j') := by
+          cases hred_j' with
+          | red h => exact .red (by rw [← hj'_eq]; exact h)
+        exact hred_old.1 ⟨.node j', hq_old⟩ hred_old_j'
+    · -- SimilarRP → same pointer
+      intro ⟨q1, hq1⟩ ⟨q2, hq2⟩ hsim
+      have hq1_old := reachable_of_heap_agree hagree hq1
+      have hq2_old := reachable_of_heap_agree hagree hq2
+      unfold OBdd.SimilarRP OBdd.Similar OBdd.HSimilar at hsim
+      have hagree_q1 : ∀ j' : Fin m.succ, Pointer.Reachable s_out_old q1 (.node j') → s_out_new[j'] = s_out_old[j'] :=
+        fun j' hj' => hagree j' (Relation.transitive_reflTransGen hq1_old hj')
+      have hagree_q2 : ∀ j' : Fin m.succ, Pointer.Reachable s_out_old q2 (.node j') → s_out_new[j'] = s_out_old[j'] :=
+        fun j' hj' => hagree j' (Relation.transitive_reflTransGen hq2_old hj')
+      have hord_q1_old : Bdd.Ordered ⟨s_out_old, q1⟩ := Bdd.ordered_of_reachable' hord_old hq1_old
+      have hord_q2_old : Bdd.Ordered ⟨s_out_old, q2⟩ := Bdd.ordered_of_reachable' hord_old hq2_old
+      have hord_q1_new : Bdd.Ordered ⟨s_out_new, q1⟩ := Bdd.ordered_of_reachable' hord' hq1
+      have hord_q2_new : Bdd.Ordered ⟨s_out_new, q2⟩ := Bdd.ordered_of_reachable' hord' hq2
+      have h_tree_q1 := toTree_eq_of_heap_agree ⟨⟨s_out_old, q1⟩, hord_q1_old⟩ s_out_new hord_q1_new hagree_q1
+      have h_tree_q2 := toTree_eq_of_heap_agree ⟨⟨s_out_old, q2⟩, hord_q2_old⟩ s_out_new hord_q2_new hagree_q2
+      have hsim_old : OBdd.toTree ⟨⟨s_out_old, q1⟩, hord_q1_old⟩ = OBdd.toTree ⟨⟨s_out_old, q2⟩, hord_q2_old⟩ := by
+        rw [← h_tree_q1, ← h_tree_q2]; exact hsim
+      show q1 = q2
+      exact hred_old.2 (show OBdd.SimilarRP ⟨⟨s_out_old, p⟩, hord_old⟩ ⟨q1, hq1_old⟩ ⟨q2, hq2_old⟩ from hsim_old)
+
+-- === Global step correctness ===
+-- The core lemma: after step, global_ok is maintained.
+-- This unifies the r-in-vlist proofs with the global_ok maintenance.
+-- For each node k with non-terminal ids[k] in s' = step(s):
+--   Case 1 (k not in vlist[i]): ids[k] unchanged, transfer from hok.global_ok(k) via heap agreement
+--   Case 2 (k in vlist[i], redundant): ids[k] = lid = hid, transfer from global_ok(child)
+--   Case 3 (k in vlist[i], new/iso): ids[k] = node(nid_val), prove from children's properties
+private lemma step_preserves_global_ok {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
+    (vlist : Vector (List (Fin m.succ)) n.succ) (i : Fin n.succ)
+    (s : State n.succ m.succ)
+    (hord_input : Bdd.Ordered ⟨v, node r⟩)
+    (hok : StateOK v r s hord_input)
+    (s' : State n.succ m.succ)
+    (hs' : s' = (StateT.run (step v vlist i) s).2) :
+    ∀ k : Fin m.succ, (¬∃ b, s'.ids[k] = terminal b) →
+      (Bdd.Ordered {heap := s'.out, root := s'.ids[k]} ∧
+       (∀ j : Fin m.succ, Pointer.Reachable s'.out s'.ids[k] (.node j) → j.val < s'.nid.val + 1) ∧
+       (∀ hord : Bdd.Ordered {heap := s'.out, root := s'.ids[k]},
+          OBdd.Reduced ⟨{heap := s'.out, root := s'.ids[k]}, hord⟩)) := by
+  intro k hk_nt
+  by_cases hk_in : k ∈ vlist[i]
+  · -- k in vlist[i]: processed at this step.
+    -- Key structural fact: children of k are NOT in vlist[i].
+    -- Since v[k].var = i (from discover_var_eq + hk_in) and input BDD is ordered,
+    -- children have strictly larger var index, so they're at different levels.
+    -- Therefore their ids are stable through populate_queue AND were established
+    -- at earlier loop iterations, so hok.global_ok gives their properties.
+    --
+    -- After step, ids[k] is either:
+    --   (a) lid (redundant: lid = hid = child's mapped id)
+    --   (b) node(nid_val) (non-redundant: set by process_queue)
+    -- In both cases, the output BDD at ids[k] must be shown correct.
+    --
+    -- This is the core Bryant correctness argument.
+    -- Decomposition into sub-lemmas needed:
+    --   1. populate_queue characterization for k in list
+    --   2. process_queue characterization for entries
+    --   3. Correctness of output BDD in each subcase
+    sorry
+  · -- k not in vlist[i]: ids[k] unchanged, transfer via helper
+    have hids_eq : s'.ids[k] = s.ids[k] := by
+      rw [hs']; exact step_ids_not_in_vlist v vlist i k hk_in s
+    have hk_nt_old : ¬∃ b, s.ids[k] = terminal b := by
+      intro ⟨b, hb⟩; exact hk_nt ⟨b, by rw [hids_eq, hb]⟩
+    obtain ⟨hord_old, hbnd_old, hred_old⟩ := hok.global_ok k hk_nt_old
+    have hnid_lt : s.nid.val < m := hok.nid_lt_m_of_any_nonterminal k hk_nt_old
+    have hagree : ∀ j : Fin m.succ, Pointer.Reachable s.out s.ids[k] (.node j) →
+        s'.out[j] = s.out[j] := by
+      intro j' hj'
+      have hle : j'.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hbnd_old j' hj')
+      rw [hs']; exact step_out_stable v vlist i s j' hle hnid_lt
+    have hnid_ge : s.nid.val ≤ s'.nid.val := by
+      rw [hs']; exact step_nid_val_ge v vlist i s hnid_lt
+    have result := transfer_correctness_via_heap_agree
+      s.out s'.out s.ids[k] s.nid s'.nid
+      hord_old hbnd_old (hred_old hord_old) hagree hnid_ge
+    -- Rewrite s'.ids[k] to s.ids[k] in goal, then apply result
+    rw [show s'.ids[k] = s.ids[k] from hids_eq]
+    exact result
+
+private lemma step_nonterminal_ordered {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
+    (vlist : Vector (List (Fin m.succ)) n.succ) (i : Fin n.succ)
+    (s : State n.succ m.succ)
+    (hord_input : Bdd.Ordered ⟨v, node r⟩)
+    (hok : StateOK v r s hord_input)
+    (s' : State n.succ m.succ)
+    (hs' : s' = (StateT.run (step v vlist i) s).2)
+    (hnt : ¬∃ b, s'.ids[r] = terminal b) :
+    Bdd.Ordered {heap := s'.out, root := s'.ids[r]} := by
+  by_cases hr : r ∈ vlist[i]
+  · -- r in vlist[i]: extract from step_preserves_global_ok
+    exact (step_preserves_global_ok v r vlist i s hord_input hok s' hs' r hnt).1
+  · have hids_eq : s'.ids[r] = s.ids[r] := by
+      rw [hs']; exact step_ids_not_in_vlist v vlist i r hr s
+    -- Transfer ordering from s.out to s'.out via heap agreement on reachable nodes
+    have hnid_lt : s.nid.val < m := hok.nid_lt_m_of_nonterminal (by rwa [hids_eq] at hnt)
+    have hagree : ∀ j : Fin m.succ, Pointer.Reachable s.out s.ids[r] (.node j) →
+        s'.out[j] = s.out[j] := by
+      intro k hk
+      have hle : k.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hok.bounded_at_root k hk)
+      have h := step_out_stable v vlist i s k hle hnid_lt
+      rw [hs']; exact h
+    -- Transfer ordering via ordered_of_heap_agree_on_reachable
+    have hord_transfer : Bdd.Ordered ⟨s'.out, s.ids[r]⟩ :=
+      ordered_of_heap_agree_on_reachable
+        ⟨⟨s.out, s.ids[r]⟩, hok.ordered_at_root⟩ s'.out hagree
+    -- Transport: RelevantEdge/MayPrecede only depend on heap, not root
+    rename_i xp yp
+    intro hedge
+    exact @hord_transfer ⟨xp.1, hids_eq ▸ xp.2⟩ ⟨yp.1, hids_eq ▸ yp.2⟩ hedge
+
 -- Obligation 2: All reachable nodes from ids[r] in the output are bounded.
 -- The bound s'.nid + 1 tracks the number of written nodes.
 -- This requires showing that step writes new nodes at positions within the
@@ -939,7 +1156,8 @@ private lemma step_nonterminal_bounded {n m : Nat}
     ∀ j : Fin m.succ, Pointer.Reachable s'.out s'.ids[r] (.node j) →
       j.val < s'.nid.val + 1 := by
   by_cases hr : r ∈ vlist[i]
-  · sorry -- r in vlist[i]: core Bryant correctness case
+  · -- r in vlist[i]: extract from step_preserves_global_ok
+    exact (step_preserves_global_ok v r vlist i s hord_input hok s' hs' r hnt).2.1
   · -- r not in vlist[i]: ids[r] unchanged, heap agrees on reachable nodes
     have hids_eq : s'.ids[r] = s.ids[r] := by rw [hs']; exact step_ids_not_in_vlist v vlist i r hr s
     -- s.ids[r] must be non-terminal (otherwise s'.ids[r] would be terminal too)
@@ -977,7 +1195,8 @@ private lemma step_nonterminal_reduced {n m : Nat}
     (hord : Bdd.Ordered {heap := s'.out, root := s'.ids[r]}) :
     OBdd.Reduced ⟨{heap := s'.out, root := s'.ids[r]}, hord⟩ := by
   by_cases hr : r ∈ vlist[i]
-  · sorry -- r in vlist[i]: core Bryant correctness case
+  · -- r in vlist[i]: extract from step_preserves_global_ok
+    exact (step_preserves_global_ok v r vlist i s hord_input hok s' hs' r hnt).2.2 hord
   · -- r not in vlist[i]: ids[r] unchanged, heap agrees on reachable nodes
     have hids_eq : s'.ids[r] = s.ids[r] := by rw [hs']; exact step_ids_not_in_vlist v vlist i r hr s
     have hs_nt : ¬∃ b, s.ids[r] = terminal b := by
@@ -1085,11 +1304,16 @@ private lemma step_nonterminal_ok {n m : Nat}
     StateOK v r s' hord_input := by
   have hord : Bdd.Ordered {heap := s'.out, root := s'.ids[r]} :=
     step_nonterminal_ordered v r vlist i s hord_input hok s' hs' hnt
+  have hglob := step_preserves_global_ok v r vlist i s hord_input hok s' hs'
+  have hnid_s' : s'.nid.val < m := by
+    rw [hs']; exact step_nid_lt_m_of_nonterminal_output v r vlist i s hord_input hok
+      (by rwa [hs'] at hnt)
   exact ⟨hord,
     step_nonterminal_bounded v r vlist i s hord_input hok s' hs' hnt,
     step_nonterminal_reduced v r vlist i s hord_input hok s' hs' hnt hord,
-    fun _ => hs' ▸ step_nid_lt_m_of_nonterminal_output v r vlist i s hord_input hok
-      (by rwa [hs'] at hnt)⟩
+    fun _ => hnid_s',
+    fun _ _ => hnid_s',
+    hglob⟩
 
 -- For the base case: after the final step, the output BDD is ordered and bounded.
 -- This is the core correctness of Bryant's reduction algorithm.
@@ -1103,7 +1327,25 @@ private lemma step_base_ok {n m : Nat}
   -- After step runs, check if ids[r] is a terminal
   set s' := (StateT.run (step v vlist i) s).2
   by_cases ht : ∃ b, s'.ids[r] = terminal b
-  · exact stateOK_of_terminal_ids v r s' hord_input ht
+  · have hglob := step_preserves_global_ok v r vlist i s hord_input hok s' rfl
+    have hnid_any : ∀ k : Fin m.succ, (¬∃ b, s'.ids[k] = terminal b) → s'.nid.val < m := by
+      intro k hk_nt
+      by_cases hk_in : k ∈ vlist[i]
+      · -- k processed at this step: similar to step_nid_lt_m_of_nonterminal_output
+        -- Non-terminal output implies at least one write happened
+        -- From hglob k hk_nt we get bounded: j.val < s'.nid.val + 1
+        -- The root ids[k] = node j0 is reachable, so j0.val < s'.nid.val + 1
+        -- Since j0 : Fin m.succ, j0.val ≤ m, so s'.nid.val ≥ 0.
+        -- Since writes went 0,1,...,nid-1 and nid wraps mod m+1:
+        -- nid ≤ m - 1 < m after any write, nid = m only in initial state
+        sorry
+      · -- k not processed: ids[k] = s.ids[k]
+        have hids_eq : s'.ids[k] = s.ids[k] := step_ids_not_in_vlist v vlist i k hk_in s
+        have hk_nt_old : ¬∃ b, s.ids[k] = terminal b := by
+          intro ⟨b, hb⟩; exact hk_nt ⟨b, by rw [hids_eq, hb]⟩
+        have hnid_old := hok.nid_lt_m_of_any_nonterminal k hk_nt_old
+        exact step_nid_lt_m v vlist i s hnid_old
+    exact stateOK_of_terminal_ids v r s' hord_input ht hglob hnid_any
   · exact step_nonterminal_ok v r vlist i s hord_input hok s' rfl ht
 
 -- Initial state satisfies the invariant
@@ -1113,7 +1355,11 @@ private lemma initial_ok {n m : Nat}
     StateOK v r (initial (n := n) (m := m)) hord_input := by
   have hids : (initial (n := n) (m := m)).ids[r] = terminal false := by
     simp [initial]
+  have hall_terminal : ∀ k : Fin m.succ, (initial (n := n) (m := m)).ids[k] = terminal false :=
+    fun k => by simp [initial]
   exact stateOK_of_terminal_ids v r _ hord_input ⟨false, hids⟩
+    (by intro k hnt; exact absurd ⟨false, hall_terminal k⟩ hnt)
+    (by intro k hnt; exact absurd ⟨false, hall_terminal k⟩ hnt)
 
 private lemma loop_result_ok {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
