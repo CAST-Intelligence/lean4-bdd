@@ -1420,6 +1420,40 @@ private lemma process_record_iso {n m : Nat}
   refine ⟨?_, set_id_to_nid_nid j s, set_id_to_nid_out j s⟩
   first | rfl | trivial
 
+-- In the new-key case of process_record, the output node written at the new nid
+-- position has var = v[entry.2].var. This is the core fact for var tracking.
+private lemma process_record_newkey_out_var {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ)
+    (curkey : Pointer m.succ × Pointer m.succ)
+    (entry : (Pointer m.succ × Pointer m.succ) × Fin m.succ)
+    (s : State n.succ m.succ)
+    (hnid : s.nid.val < m)
+    (hneq : entry.1 ≠ curkey) :
+    let pr := StateT.run (process_record v curkey entry) s
+    pr.2.out[pr.2.nid].var = v[entry.2].var := by
+  obtain ⟨⟨key_low, key_high⟩, j⟩ := entry
+  simp only at hneq
+  rcases hlow : v[j].low with b1 | k1 <;> rcases hhigh : v[j].high with b2 | k2
+  all_goals (
+    unfold process_record
+    simp only [stateT_run_bind, get_id_run, hlow, hhigh, stateT_run_pure]
+    simp only [hneq, ite_false]
+    simp only [set_out, set_id_to_nid, set_id, StateT.run, StateT.bind, Bind.bind,
+      StateT.get, StateT.set, StateT.pure, get, set, pure, MonadState.get, getThe,
+      MonadStateOf.get, MonadStateOf.set, Id.run, get_id]
+    -- Goal: (s.out.set pos node)[s.nid + 1].var = v[j].var
+    -- The write position (nid+1)%m.succ and read position (nid+1 as Fin) match.
+    simp only [Fin.getElem_fin, Vector.getElem_set]
+    split
+    · rfl
+    · next h =>
+      exfalso; apply h
+      rw [Fin.val_add_one]
+      split
+      · next heq => exfalso; rw [heq] at hnid; simp [Fin.val_last] at hnid
+      · exact Nat.mod_eq_of_lt (by omega : s.nid.val + 1 < m.succ)
+  )
+
 -- process_queue preserves out[k] when k ≤ s.nid and s.nid + Q.length ≤ m.
 -- The queue-length bound ensures nid < m throughout processing, since each
 -- record increments nid by at most 1 and the queue shrinks by 1.
@@ -1450,6 +1484,140 @@ private lemma process_queue_out_stable {n m : Nat}
     trans s₁.2.out[k]
     · exact ih s₁.1 s₁.2 (Nat.le_trans hk hle) hbound'
     · exact process_record_out_stable v curkey head s k hk hnid
+
+-- All output nodes written during process_queue (at positions strictly above s.nid
+-- and at most s'.nid) have var = i, provided all queue entries have var = i.
+private lemma process_queue_written_var {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ)
+    (curkey : Pointer m.succ × Pointer m.succ)
+    (Q : List ((Pointer m.succ × Pointer m.succ) × Fin m.succ))
+    (s : State n.succ m.succ)
+    (hbound : s.nid.val + Q.length ≤ m)
+    (hnonred : ∀ e ∈ Q, e.1.1 ≠ e.1.2)
+    (i : Fin n.succ)
+    (hvar_eq : ∀ e ∈ Q, v[e.2].var = i) :
+    ∀ k : Fin m.succ, s.nid.val < k.val →
+      k.val ≤ (StateT.run (process_queue v curkey Q) s).2.nid.val →
+      (StateT.run (process_queue v curkey Q) s).2.out[k].var = i := by
+  induction Q generalizing curkey s with
+  | nil =>
+    simp [process_queue, StateT.run, pure, StateT.pure]
+    intro k h1 h2; omega
+  | cons head tail ih =>
+    intro k hk_gt hk_le
+    have hnid : s.nid.val < m := by
+      have : (head :: tail).length = tail.length + 1 := List.length_cons ..
+      omega
+    simp only [process_queue, stateT_run_bind] at hk_le ⊢
+    set pr := StateT.run (process_record v curkey head) s with hpr_def
+    have hle : s.nid.val ≤ pr.2.nid.val :=
+      process_record_nid_val_ge v curkey head s hnid
+    have hle_succ : pr.2.nid.val ≤ s.nid.val + 1 :=
+      process_record_nid_val_le_succ v curkey head s hnid
+    have hbound' : pr.2.nid.val + tail.length ≤ m := by
+      have : (head :: tail).length = tail.length + 1 := List.length_cons ..
+      omega
+    by_cases hk_pr : k.val ≤ pr.2.nid.val
+    · -- k was written during process_record for head
+      have hneq : head.1 ≠ curkey := by
+        intro heq
+        have ⟨_, hnid_eq, _⟩ := process_record_iso v curkey head s heq
+        rw [show pr.2.nid = s.nid from hnid_eq] at hk_pr
+        omega
+      have hk_eq : k.val = pr.2.nid.val := by omega
+      have hvar_pr : pr.2.out[pr.2.nid].var = v[head.2].var :=
+        process_record_newkey_out_var v curkey head s hnid hneq
+      have hvar_i : v[head.2].var = i := hvar_eq head (List.mem_cons_self ..)
+      have hout_stable : (StateT.run (process_queue v pr.1 tail) pr.2).2.out[k] = pr.2.out[k] :=
+        process_queue_out_stable v pr.1 tail pr.2 k hk_pr hbound'
+      rw [hout_stable]
+      have hk_fin : k = pr.2.nid := Fin.ext hk_eq
+      subst hk_fin
+      rw [hvar_pr, hvar_i]
+    · -- k was written during process_queue on tail
+      push_neg at hk_pr
+      exact ih pr.1 pr.2 hbound'
+        (fun e he => hnonred e (List.mem_cons_of_mem _ he))
+        (fun e he => hvar_eq e (List.mem_cons_of_mem _ he))
+        k hk_pr hk_le
+
+-- For each queue entry e, after process_queue, if ids[e.2] = node k,
+-- then out[k].var = i (provided all entries have var = i).
+-- The curkey condition handles the iso case: either iso is impossible
+-- (curkey.1 = curkey.2 with non-redundant entries) or the node at s.nid
+-- was written by a previous new-key entry with var = i.
+private lemma process_queue_entry_var_eq {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ)
+    (curkey : Pointer m.succ × Pointer m.succ)
+    (Q : List ((Pointer m.succ × Pointer m.succ) × Fin m.succ))
+    (s : State n.succ m.succ)
+    (hbound : s.nid.val + Q.length ≤ m)
+    (hnonred : ∀ e ∈ Q, e.1.1 ≠ e.1.2)
+    (i : Fin n.succ)
+    (hvar : ∀ e ∈ Q, v[e.2].var = i)
+    (hcurkey_or_var : curkey.1 = curkey.2 ∨ s.out[s.nid].var = i) :
+    ∀ e ∈ Q, ∀ k : Fin m.succ,
+      (StateT.run (process_queue v curkey Q) s).2.ids[e.2] = node k →
+      (StateT.run (process_queue v curkey Q) s).2.out[k].var = i := by
+  induction Q generalizing curkey s with
+  | nil => intro e he; nomatch he
+  | cons head tail ih =>
+    intro e he k hfinal
+    have hnid : s.nid.val < m := by
+      have : (head :: tail).length = tail.length + 1 := List.length_cons ..
+      omega
+    simp only [process_queue, stateT_run_bind] at hfinal ⊢
+    set pr := StateT.run (process_record v curkey head) s with hpr_def
+    have hle : s.nid.val ≤ pr.2.nid.val :=
+      process_record_nid_val_ge v curkey head s hnid
+    have hle_succ : pr.2.nid.val ≤ s.nid.val + 1 :=
+      process_record_nid_val_le_succ v curkey head s hnid
+    have hbound' : pr.2.nid.val + tail.length ≤ m := by
+      have : (head :: tail).length = tail.length + 1 := List.length_cons ..
+      omega
+    have hids_self : pr.2.ids[head.2] = node pr.2.nid := by
+      have := process_record_ids_self v curkey head s hnid
+      rw [← hpr_def] at this; exact this
+    have hvar_head : v[head.2].var = i := hvar head (List.mem_cons_self ..)
+    -- Show pr.2.out[pr.2.nid].var = i (needed for both iso transfer and IH)
+    have hprop : pr.2.out[pr.2.nid].var = i := by
+      by_cases hiso : head.1 = curkey
+      · have ⟨_, hnid_eq, hout_eq⟩ := process_record_iso v curkey head s hiso
+        rw [← hpr_def] at hnid_eq hout_eq
+        simp only [hnid_eq, hout_eq]
+        rcases hcurkey_or_var with hceq | hvar_nid
+        · exfalso; exact hnonred head (List.mem_cons_self ..) (hiso ▸ hceq)
+        · exact hvar_nid
+      · exact (process_record_newkey_out_var v curkey head s hnid hiso).trans hvar_head
+    rcases List.mem_cons.mp he with rfl | he_tail
+    · -- e = head (after rfl, head is replaced by e throughout)
+      by_cases hstable :
+          (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[e.2] = pr.2.ids[e.2]
+      · -- tail didn't change ids[e.2]: k = pr.2.nid
+        have hk : k = pr.2.nid := by
+          have : node k = node pr.2.nid := by rw [← hfinal, hstable, hids_self]
+          injection this
+        subst hk
+        have hstab := process_queue_out_stable v pr.1 tail pr.2 pr.2.nid (le_refl _) hbound'
+        exact (congrArg (·.var) hstab).trans hprop
+      · -- tail changed ids[e.2]: ∃ e' ∈ tail with e'.2 = e.2
+        have : ∃ e' ∈ tail, e'.2 = e.2 := by
+          by_contra h; push_neg at h
+          exact hstable (process_queue_ids_not_in_entries v pr.1 tail e.2 h pr.2)
+        obtain ⟨e', he'_tail, he'_eq⟩ := this
+        have hck' : (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[e'.2] = node k := by
+          simp only [he'_eq]; exact hfinal
+        exact ih pr.1 pr.2 hbound'
+          (fun e' he' => hnonred e' (List.mem_cons_of_mem _ he'))
+          (fun e' he' => hvar e' (List.mem_cons_of_mem _ he'))
+          (Or.inr hprop)
+          e' he'_tail k hck'
+    · -- e ∈ tail: direct IH
+      exact ih pr.1 pr.2 hbound'
+        (fun e' he' => hnonred e' (List.mem_cons_of_mem _ he'))
+        (fun e' he' => hvar e' (List.mem_cons_of_mem _ he'))
+        (Or.inr hprop)
+        e he_tail k hfinal
 
 -- process_queue nid.val is non-decreasing when s.nid + Q.length ≤ m
 private lemma process_queue_nid_val_ge {n m : Nat}
@@ -1967,8 +2135,96 @@ private lemma step_preserves_var_ge {n m : Nat}
   intro c k hck
   by_cases hc_in : c ∈ vlist[i]
   · -- c in vlist[i]: processed at this step
+    -- Decompose step = populate_queue ; process_queue (mergeSort Q)
+    rw [hs']
+    simp only [step, stateT_run_bind]
+    set s₁ := (StateT.run (populate_queue v [] vlist[i]) s).2
+    set Q := (StateT.run (populate_queue v [] vlist[i]) s).1
+    set s₂ := (StateT.run (process_queue v (node 0, node 0) Q.mergeSort) s₁).2
+    -- Convert hck to s₂ terms
+    have hck₂ : s₂.ids[c] = node k := by
+      have h := hck; rw [hs'] at h; simp only [step, stateT_run_bind] at h; exact h
+    -- VlistOK properties
+    have hvlist_i := hvlist i
+    have hnodup_i : vlist[i].Nodup := hvlist_i.2.2.1
+    have hvar_eq_i : ∀ j ∈ vlist[i], v[j].var = i := hvlist_i.1
+    have hchildren_i : ∀ j ∈ vlist[i], ∀ c' : Fin m.succ,
+        (v[j].low = node c' ∨ v[j].high = node c') → c' ∉ vlist[i] :=
+      hvlist_i.2.1
+    have hedge_ordering_i : ∀ j ∈ vlist[i], ∀ c' : Fin m.succ,
+        (v[j].low = node c' ∨ v[j].high = node c') → v[j].var.val < v[c'].var.val :=
+      hvlist_i.2.2.2
+    -- Populate_queue preserves nid and out
+    have hs₁_nid : s₁.nid = s.nid := by simp only [s₁]; exact populate_queue_nid v [] vlist[i] s
+    have hs₁_out : s₁.out = s.out := by simp only [s₁]; exact populate_queue_out v [] vlist[i] s
+    -- Queue length bound
+    have hQ_len : Q.length ≤ vlist[i].length := by
+      have := populate_queue_length_le v [] vlist[i] s
+      simp only [List.length_nil, Nat.zero_add] at this; exact this
+    have hpq_bound : s₁.nid.val + Q.mergeSort.length ≤ m := by
+      rw [hs₁_nid, List.length_mergeSort]; omega
     -- Case split: redundant vs non-redundant
-    sorry
+    by_cases hred : resolve_id s (v[c].low) = resolve_id s (v[c].high)
+    · -- REDUNDANT: ids[c] mapped to resolve_id s (v[c].low) during populate_queue
+      have hc_not_in_Q : ∀ entry ∈ Q.mergeSort, entry.2 ≠ c := by
+        intro entry hentry
+        have hentry' : entry ∈ Q := (List.mergeSort_perm Q _).mem_iff.mp hentry
+        exact populate_queue_redundant_not_in_queue v [] vlist[i] c
+          hc_in hnodup_i hchildren_i s hred (by simp) entry hentry'
+      have hs₂_ids_c : s₂.ids[c] = s₁.ids[c] :=
+        process_queue_ids_not_in_entries v _ Q.mergeSort c hc_not_in_Q s₁
+      have hs₁_ids_c : s₁.ids[c] = resolve_id s (v[c].low) :=
+        populate_queue_ids_redundant v [] vlist[i] c hc_in hnodup_i hchildren_i s hred
+      have hids_c : s₂.ids[c] = resolve_id s (v[c].low) := by rw [hs₂_ids_c, hs₁_ids_c]
+      -- Get the child node (must be non-terminal since ids[c] = node k)
+      rcases hlow_cases : v[c].low with b | c'
+      · -- Terminal child: ids[c] = terminal b, contradicts ids[c] = node k
+        exfalso; simp only [resolve_id, hlow_cases] at hids_c; rw [hids_c] at hck₂; cases hck₂
+      · -- Node child c': resolve_id s (node c') = s.ids[c']
+        simp only [resolve_id, hlow_cases] at hids_c
+        -- hids_c : s₂.ids[c] = s.ids[c'], hck₂ : s₂.ids[c] = node k
+        have hids_c' : s.ids[c'] = node k := by rw [← hids_c]; exact hck₂
+        -- Edge ordering: v[c].var.val < v[c'].var.val
+        have hvar_lt : v[c].var.val < v[c'].var.val :=
+          hedge_ordering_i c hc_in c' (Or.inl hlow_cases)
+        -- From hok.var_ge: v[c'].var.val ≤ s.out[k].var.val
+        have hvar_ge_c' : v[c'].var.val ≤ s.out[k].var.val := hok.var_ge c' k hids_c'
+        -- k.val ≤ s.nid.val (from boundedness via global_ok)
+        have hk_nt : ¬∃ b, s.ids[c'] = terminal b := by
+          intro ⟨b, hb⟩; rw [hb] at hids_c'; cases hids_c'
+        obtain ⟨_, hbnd, _⟩ := hok.global_ok c' hk_nt
+        have hk_le : k.val ≤ s.nid.val :=
+          Nat.lt_succ_iff.mp (hbnd k (by rw [hids_c']; exact Relation.ReflTransGen.refl))
+        -- s₂.out[k] = s.out[k]
+        have hout_eq : s₂.out[k] = s.out[k] := by
+          trans s₁.out[k]
+          · exact process_queue_out_stable v _ Q.mergeSort s₁ k
+              (by rw [hs₁_nid]; exact hk_le) hpq_bound
+          · simp only [hs₁_out]
+        exact le_trans (le_of_lt hvar_lt)
+          (le_trans hvar_ge_c' (le_of_eq (congrArg (fun n => n.var.val) hout_eq).symm))
+    · -- NON-REDUNDANT: c has a queue entry, use process_queue_entry_var_eq
+      have ⟨entry, hentry_Q, hentry_c⟩ :=
+        populate_queue_nonredundant_in_queue v [] vlist[i] c hc_in hnodup_i hchildren_i s hred
+      have hentry_sorted : entry ∈ Q.mergeSort :=
+        (List.mergeSort_perm Q _).mem_iff.mpr hentry_Q
+      have hvar_entries : ∀ e ∈ Q.mergeSort, v[e.2].var = i := by
+        intro e he
+        have he_Q : e ∈ Q := (List.mergeSort_perm Q _).mem_iff.mp he
+        rcases populate_queue_entries_subset v [] vlist[i] s e he_Q with h | h
+        · exact hvar_eq_i e.2 h
+        · nomatch h
+      have hnonred_entries : ∀ e ∈ Q.mergeSort, e.1.1 ≠ e.1.2 := by
+        intro e he
+        have he_Q : e ∈ Q := (List.mergeSort_perm Q _).mem_iff.mp he
+        exact populate_queue_entries_nonredundant v [] vlist[i] s (by simp) e he_Q
+      have hids_entry : s₂.ids[entry.2] = node k := by
+        simp only [hentry_c]; exact hck₂
+      have hvar_k : s₂.out[k].var = i :=
+        process_queue_entry_var_eq v _ Q.mergeSort s₁ hpq_bound hnonred_entries i
+          hvar_entries (Or.inl rfl) entry hentry_sorted k hids_entry
+      have hvar_c : v[c].var = i := hvar_eq_i c hc_in
+      exact le_of_eq ((congrArg Fin.val hvar_c).trans (congrArg Fin.val hvar_k).symm)
   · -- c not in vlist[i]: ids[c] unchanged through step
     have hids_eq : s'.ids[c] = s.ids[c] := by
       rw [hs']; exact step_ids_not_in_vlist v vlist i c hc_in s
