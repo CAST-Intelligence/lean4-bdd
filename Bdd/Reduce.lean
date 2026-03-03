@@ -148,10 +148,13 @@ private structure State (n) (m) where
   ids : Vector (Pointer m) m
   nid : Fin m
 
+-- Position 0 is the first write target (nid starts at 0, set_out writes at nid).
+-- All positions start with self-referencing junk (node 0 -> node 0) which violates
+-- strict variable ordering, so h_unique_below_nid is vacuously true for nid = 0.
 private def initial {n m : Nat} : State n.succ m.succ :=
-  ⟨ (Vector.replicate m.succ {var := 0, low := terminal false, high := terminal true}),
+  ⟨ (Vector.replicate m.succ {var := 0, low := node 0, high := node 0}),
     (Vector.replicate m.succ (terminal false)),
-    Fin.last m
+    0
   ⟩
 
 private def get_out : StateM (State n m) (Vector (Node n m) m) := get >>= fun s ↦ pure s.out
@@ -166,10 +169,13 @@ private def set_id : Fin m → Pointer m → StateM (State n m) Unit :=
 private def set_id_to_nid : Fin m → StateM (State n m) Unit :=
   fun j ↦ get >>= fun s ↦ set_id j (node s.nid)
 
-private def set_out {n m : Nat} : Node n.succ m.succ → StateM (State n.succ m.succ) Unit :=
+private def write_out {n m : Nat} : Node n.succ m.succ → StateM (State n.succ m.succ) Unit :=
   fun N ↦ get >>= fun s ↦
-    have : (s.nid.1 + 1) % m.succ < m.succ := by simp [Nat.mod_lt]
-    set (⟨s.out.set ((s.nid.1 + 1) % m.succ) N, s.ids, s.nid + 1⟩ : State n.succ m.succ)
+    set (⟨s.out.set s.nid N, s.ids, s.nid⟩ : State n.succ m.succ)
+
+private def advance_nid {n m : Nat} : StateM (State n.succ m.succ) Unit :=
+  get >>= fun s ↦
+    set (⟨s.out, s.ids, s.nid + 1⟩ : State n.succ m.succ)
 
 private def populate_queue (v : Vector (Node n m) m) (acc : List ((Pointer m × Pointer m) × Fin m)) : List (Fin m) → StateM (State n m) (List ((Pointer m × Pointer m) × Fin m))
   | [] => pure acc
@@ -191,9 +197,10 @@ private def process_record {n m : Nat} (v : Vector (Node n.succ m.succ) m.succ) 
     set_id_to_nid j
     pure curkey
   else
+    advance_nid
     let lid ← get_id v[j].low
     let hid ← get_id v[j].high
-    set_out ⟨v[j].var, lid, hid⟩
+    write_out ⟨v[j].var, lid, hid⟩
     set_id_to_nid j
     pure key
 
@@ -287,6 +294,27 @@ private structure StateOK {n m : Nat}
       output nodes relative to their children (the hvar_lt_child hypothesis). -/
   var_ge :
     ∀ c k : Fin m.succ, s.ids[c] = node k → v[c].var.val ≤ s.out[k].var.val
+  /-- Heap closure at/below nid: all edges from output nodes at positions ≤ nid
+      point to positions ≤ nid (or terminals). In Option C, the write goes to
+      nid+1 (after advance), so position nid was the most recently written slot.
+      We use ≤ to capture that position nid's edges are also closed. -/
+  heap_closed_below :
+    ∀ (j : Fin m.succ), j.val ≤ s.nid.val →
+      (∀ k : Fin m.succ, s.out[j].low = node k → k.val ≤ s.nid.val) ∧
+      (∀ k : Fin m.succ, s.out[j].high = node k → k.val ≤ s.nid.val)
+  /-- Uniqueness below nid: distinct positions below nid with ordered, bounded subtrees
+      have distinct tree representations. The bounded form (< nid) enables transfer
+      between heaps that agree on positions < nid. -/
+  unique_below_nid :
+    ∀ (i j : Fin m.succ),
+      i.val < s.nid.val → j.val < s.nid.val →
+      ∀ (hord_i : Bdd.Ordered {heap := s.out, root := node i})
+        (hord_j : Bdd.Ordered {heap := s.out, root := node j}),
+      (∀ k : Fin m.succ, Pointer.Reachable s.out (node i) (.node k) → k.val ≤ s.nid.val) →
+      (∀ k : Fin m.succ, Pointer.Reachable s.out (node j) (.node k) → k.val ≤ s.nid.val) →
+      OBdd.toTree ⟨{heap := s.out, root := node i}, hord_i⟩ =
+      OBdd.toTree ⟨{heap := s.out, root := node j}, hord_j⟩ →
+      i = j
 
 -- We prove loop_result_ok by mirroring the structure of loop.
 -- The key insight: in the base case, the result BDD is {heap := s'.out, root := s'.ids[r]}
@@ -305,7 +333,19 @@ private lemma stateOK_of_terminal_ids {n m : Nat}
        (∀ j : Fin m.succ, Pointer.Reachable s.out s.ids[k] (.node j) → j.val < s.nid.val + 1) ∧
        (∀ hord : Bdd.Ordered {heap := s.out, root := s.ids[k]},
           OBdd.Reduced ⟨{heap := s.out, root := s.ids[k]}, hord⟩)))
-    (hvar_ge : ∀ c k : Fin m.succ, s.ids[c] = node k → v[c].var.val ≤ s.out[k].var.val) :
+    (hvar_ge : ∀ c k : Fin m.succ, s.ids[c] = node k → v[c].var.val ≤ s.out[k].var.val)
+    (hclosed : ∀ (j : Fin m.succ), j.val ≤ s.nid.val →
+      (∀ k : Fin m.succ, s.out[j].low = node k → k.val ≤ s.nid.val) ∧
+      (∀ k : Fin m.succ, s.out[j].high = node k → k.val ≤ s.nid.val))
+    (huniq : ∀ (i j : Fin m.succ),
+      i.val < s.nid.val → j.val < s.nid.val →
+      ∀ (hord_i : Bdd.Ordered {heap := s.out, root := node i})
+        (hord_j : Bdd.Ordered {heap := s.out, root := node j}),
+      (∀ k : Fin m.succ, Pointer.Reachable s.out (node i) (.node k) → k.val ≤ s.nid.val) →
+      (∀ k : Fin m.succ, Pointer.Reachable s.out (node j) (.node k) → k.val ≤ s.nid.val) →
+      OBdd.toTree ⟨{heap := s.out, root := node i}, hord_i⟩ =
+      OBdd.toTree ⟨{heap := s.out, root := node j}, hord_j⟩ →
+      i = j) :
     StateOK v r s hord_input := by
   obtain ⟨b, hb⟩ := ht
   have hord : Bdd.Ordered {heap := s.out, root := s.ids[r]} := by
@@ -320,6 +360,8 @@ private lemma stateOK_of_terminal_ids {n m : Nat}
       exact OBdd.reduced_of_terminal this
     global_ok := hglob
     var_ge := hvar_ge
+    heap_closed_below := hclosed
+    unique_below_nid := huniq
   }
 
 -- get_id is a pure read operation - unfold helper
@@ -522,10 +564,31 @@ private lemma populate_queue_entries_subset {n m : Nat}
           · exact Or.inr h'
     )
 
--- set_out modifies out and nid, but preserves ids.
-private lemma set_out_ids {n m : Nat} (N : Node n.succ m.succ) (r : Fin m.succ) (s : State n.succ m.succ) :
-    (StateT.run (set_out N) s).2.ids[r] = s.ids[r] := by
-  simp [set_out, StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
+-- write_out modifies out but preserves ids and nid.
+private lemma write_out_ids {n m : Nat} (N : Node n.succ m.succ) (r : Fin m.succ) (s : State n.succ m.succ) :
+    (StateT.run (write_out N) s).2.ids[r] = s.ids[r] := by
+  simp [write_out, StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
+        get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set]
+
+private lemma write_out_nid {n m : Nat} (N : Node n.succ m.succ) (s : State n.succ m.succ) :
+    (StateT.run (write_out N) s).2.nid = s.nid := by
+  simp [write_out, StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
+        get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set]
+
+-- advance_nid modifies nid but preserves ids and out.
+private lemma advance_nid_ids {n m : Nat} (r : Fin m.succ) (s : State n.succ m.succ) :
+    (StateT.run (advance_nid) s).2.ids[r] = s.ids[r] := by
+  simp [advance_nid, StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
+        get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set]
+
+private lemma advance_nid_out {n m : Nat} (s : State n.succ m.succ) :
+    (StateT.run (advance_nid) s).2.out = s.out := by
+  simp [advance_nid, StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
+        get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set]
+
+private lemma advance_nid_nid {n m : Nat} (s : State n.succ m.succ) :
+    (StateT.run (advance_nid) s).2.nid = s.nid + 1 := by
+  simp [advance_nid, StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
         get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set]
 
 -- set_id_to_nid j modifies ids[j] only; preserves ids[r] when r ≠ j.
@@ -558,16 +621,19 @@ private lemma process_record_ids_ne {n m : Nat}
     · -- key = curkey: set_id_to_nid j, then pure
       simp only [stateT_run_bind, stateT_run_pure]
       exact set_id_to_nid_ids_ne j r hr.symm _
-    · -- key ≠ curkey: set_out, set_id_to_nid j, pure
+    · -- key ≠ curkey: advance_nid, get_id, get_id, write_out, set_id_to_nid j, pure
       simp only [stateT_run_bind, get_id_run, hlow, hhigh, stateT_run_pure]
-      simp only [set_out, set_id_to_nid, set_id, stateT_run_bind, stateT_run_pure,
+      simp only [advance_nid, write_out, set_id_to_nid, set_id, stateT_run_bind, stateT_run_pure,
                  StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
                  get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set,
                  Id.run]
       exact Vector.getElem_set_ne _ _ (Fin.val_ne_of_ne hr)
   )
 
--- process_record sets ids[j] = node(result_nid) where result_nid is the nid of the result state.
+-- process_record sets ids[j] = node(result.nid) where result is the output state.
+-- In the iso case: result.nid = s.nid, so ids[j] = node(s.nid).
+-- In the new-key case: result.nid = s.nid + 1, and ids[j] = node(s.nid + 1) = node(result.nid).
+-- In both cases, ids[j] = node(result.nid).
 private lemma process_record_ids_self {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (curkey : Pointer m.succ × Pointer m.succ)
@@ -589,9 +655,9 @@ private lemma process_record_ids_self {n m : Nat}
         StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
         get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set, Id.run,
         Vector.getElem_set_self, Fin.getElem_fin]
-    · -- key ≠ curkey: set_out, set_id_to_nid j, pure
+    · -- key ≠ curkey: advance_nid, get_id, get_id, write_out, set_id_to_nid j, pure
       simp only [stateT_run_bind, get_id_run, hlow, hhigh, stateT_run_pure]
-      simp only [set_out, set_id_to_nid, set_id, stateT_run_bind, stateT_run_pure,
+      simp only [advance_nid, write_out, set_id_to_nid, set_id, stateT_run_bind, stateT_run_pure,
         StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
         get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set, Id.run,
         Vector.getElem_set_self, Fin.getElem_fin]
@@ -1085,6 +1151,74 @@ private lemma populate_queue_entry_keys_child {n m : Nat}
   populate_queue_entry_keys_child_aux v [] l s s l (List.Subset.refl _) hnodup hchildren
     (fun _ _ => rfl) (fun _ h => by contradiction) entry he
 
+-- Auxiliary: entries from populate_queue have keys equal to resolve_id at s₀.
+-- Uses l₀/hl_sub pattern for recursion stability (same as other populate_queue lemmas).
+private lemma populate_queue_entry_key_eq_resolve_aux {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ)
+    (acc : List ((Pointer m.succ × Pointer m.succ) × Fin m.succ))
+    (l : List (Fin m.succ))
+    (s s₀ : State n.succ m.succ)
+    (l₀ : List (Fin m.succ))
+    (hl_sub : l ⊆ l₀)
+    (hnodup : l.Nodup)
+    (hchildren : ∀ j ∈ l, ∀ c : Fin m.succ, (v[j].low = node c ∨ v[j].high = node c) → c ∉ l₀)
+    (hids_agree : ∀ c : Fin m.succ, c ∉ l₀ → s.ids[c] = s₀.ids[c])
+    (hacc : ∀ e ∈ acc, e.1 = (resolve_id s₀ (v[e.2].low), resolve_id s₀ (v[e.2].high))) :
+    ∀ e ∈ (StateT.run (populate_queue v acc l) s).1,
+      e.1 = (resolve_id s₀ (v[e.2].low), resolve_id s₀ (v[e.2].high)) := by
+  induction l generalizing acc s with
+  | nil =>
+    intro e he
+    simp [populate_queue, StateT.run, pure, StateT.pure] at he
+    exact hacc e he
+  | cons j tail ih =>
+    have hnodup_tail : tail.Nodup := (List.nodup_cons.mp hnodup).2
+    have hj_in_l₀ : j ∈ l₀ := hl_sub (List.mem_cons_self ..)
+    have htail_sub : tail ⊆ l₀ := fun x hx => hl_sub (List.mem_cons_of_mem _ hx)
+    have hchildren_tail : ∀ j' ∈ tail, ∀ c : Fin m.succ,
+        (v[j'].low = node c ∨ v[j'].high = node c) → c ∉ l₀ :=
+      fun j' hj' c hc => hchildren j' (List.mem_cons_of_mem _ hj') c hc
+    intro e he
+    rcases hlow : v[j].low with b1 | k1 <;> rcases hhigh : v[j].high with b2 | k2
+    all_goals (
+      unfold populate_queue at he
+      simp only [stateT_run_bind, get_id_run, hlow, hhigh] at he
+      split at he
+      · -- redundant: set_id j lid, recurse with same acc
+        simp only [stateT_run_bind, set_id_run'] at he
+        refine ih _ _ htail_sub hnodup_tail hchildren_tail ?_ hacc e he
+        intro c hc
+        have hcj : c ≠ j := fun h => hc (h ▸ hj_in_l₀)
+        simp only [Fin.getElem_fin]
+        rw [Vector.getElem_set_ne _ _ (Fin.val_ne_of_ne hcj).symm]
+        exact hids_agree c hc
+      · -- non-redundant: extend acc with ((lid, hid), j)
+        refine ih _ _ htail_sub hnodup_tail hchildren_tail hids_agree ?_ e he
+        intro e' he'
+        rcases List.mem_cons.mp he' with rfl | he''
+        · -- e' is the newly added entry ((lid, hid), j)
+          show (_, _) = (resolve_id s₀ (v[j].low), resolve_id s₀ (v[j].high))
+          simp only [hlow, hhigh, resolve_id]
+          try (apply Prod.ext <;> simp only [] <;> (first
+            | rfl
+            | exact hids_agree _ (hchildren j (List.mem_cons_self ..) _
+                (by first | exact Or.inl hlow | exact Or.inr hhigh))))
+        · exact hacc e' he''
+    )
+
+-- Wrapper: entries from populate_queue have keys equal to resolve_id at s.
+private lemma populate_queue_entry_key_eq_resolve {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ)
+    (l : List (Fin m.succ))
+    (s : State n.succ m.succ)
+    (hnodup : l.Nodup)
+    (hchildren : ∀ j ∈ l, ∀ c : Fin m.succ, (v[j].low = node c ∨ v[j].high = node c) → c ∉ l)
+    (entry : (Pointer m.succ × Pointer m.succ) × Fin m.succ)
+    (he : entry ∈ (StateT.run (populate_queue v [] l) s).1) :
+    entry.1 = (resolve_id s (v[entry.2].low), resolve_id s (v[entry.2].high)) :=
+  populate_queue_entry_key_eq_resolve_aux v [] l s s l (List.Subset.refl _) hnodup hchildren
+    (fun _ _ => rfl) (fun _ h => by contradiction) entry he
+
 -- When k is non-redundant and in l, populate_queue produces an entry with .2 = k.
 private lemma populate_queue_nonredundant_in_queue {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
@@ -1306,8 +1440,8 @@ private lemma set_id_to_nid_out {n m : Nat} (j : Fin m.succ) (s : State n.succ m
 
 -- === Infrastructure: process_record preserves out at positions ≤ nid (when nid < m) ===
 -- Proof: In the isomorphism branch, only ids changes (via set_id_to_nid).
--- In the new-node branch, set_out writes at (nid+1)%m.succ = nid+1 (since nid<m),
--- and set_id_to_nid doesn't touch out. Since k ≤ nid < nid+1, k ≠ write position.
+-- In the new-node branch, advance_nid increments nid, then write_out writes at nid+1.
+-- set_id_to_nid doesn't touch out. Since k ≤ nid < nid+1, k ≠ write position.
 private lemma process_record_out_stable {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (curkey : Pointer m.succ × Pointer m.succ)
@@ -1328,22 +1462,21 @@ private lemma process_record_out_stable {n m : Nat}
                  set_id_to_nid, set_id, StateT.run, StateT.bind, Bind.bind, StateT.get,
                  StateT.set, StateT.pure, get, set, pure, MonadState.get, getThe,
                  MonadStateOf.get, MonadStateOf.set, Id.run]
-    · -- key != curkey: set_out writes at (nid+1)%m.succ, set_id_to_nid preserves out
+    · -- key != curkey: advance_nid, get_id, get_id, write_out at nid+1, set_id_to_nid
       simp only [stateT_run_bind, get_id_run, hlow, hhigh, stateT_run_pure,
-                 set_out, set_id_to_nid, set_id, StateT.run, StateT.bind, Bind.bind,
+                 advance_nid, write_out, set_id_to_nid, set_id, StateT.run, StateT.bind, Bind.bind,
                  StateT.get, StateT.set, StateT.pure, get, set, pure, MonadState.get, getThe,
                  MonadStateOf.get, MonadStateOf.set, Id.run, get_id]
       apply Vector.getElem_set_ne
-      intro heq
-      have hmod : (s.nid.val + 1) % m.succ = s.nid.val + 1 := Nat.mod_eq_of_lt (by omega)
+      have hne : s.nid ≠ Fin.last m := by intro h; rw [Fin.ext_iff] at h; simp [Fin.val_last] at h; omega
+      have hval := Fin.val_add_one s.nid
+      rw [if_neg hne] at hval
+      rw [show (s.nid + 1 : Fin m.succ).val = s.nid.val + 1 from hval]
       omega
   )
 
--- Auxiliary: set_out advances nid by 1 (as Fin)
-private lemma set_out_nid {n m : Nat} (N : Node n.succ m.succ) (s : State n.succ m.succ) :
-    (StateT.run (set_out N) s).2.nid = s.nid + 1 := by
-  simp [set_out, StateT.run, StateT.bind, Bind.bind, StateT.get, StateT.set, StateT.pure,
-        get, set, pure, MonadState.get, getThe, MonadStateOf.get, MonadStateOf.set]
+-- Auxiliary: write_out preserves nid; advance_nid increments by 1.
+-- (set_out_nid replaced by advance_nid_nid and write_out_nid above)
 
 -- process_record: nid.val is non-decreasing when nid < m
 private lemma process_record_nid_val_ge {n m : Nat}
@@ -1362,15 +1495,15 @@ private lemma process_record_nid_val_ge {n m : Nat}
     · -- key = curkey: nid unchanged (set_id_to_nid preserves nid)
       simp only [stateT_run_bind, stateT_run_pure]
       rw [show (StateT.run (set_id_to_nid j) s).2.nid = s.nid from set_id_to_nid_nid j s]
-    · -- key != curkey: nid advances by 1 via set_out
+    · -- key != curkey: nid advances by 1 via advance_nid (write_out and set_id_to_nid preserve nid)
       simp only [stateT_run_bind, stateT_run_pure,
-        get_id_run_terminal, get_id_run_node, set_id_to_nid_nid, set_out_nid,
+        get_id_run_terminal, get_id_run_node, set_id_to_nid_nid, write_out_nid, advance_nid_nid,
         Fin.val_add_one]
       split <;> simp_all [Fin.val_last]
   )
 
 -- process_record increments nid by at most 1 when nid < m.
--- key = curkey: nid unchanged. key != curkey: set_out increments nid by 1.
+-- key = curkey: nid unchanged. key != curkey: advance_nid increments nid by 1.
 -- Since nid < m, nid != Fin.last m, so Fin.val_add_one gives nid' = nid + 1.
 private lemma process_record_nid_val_le_succ {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
@@ -1391,7 +1524,7 @@ private lemma process_record_nid_val_le_succ {n m : Nat}
       omega
     · -- key != curkey: nid advances by 1
       simp only [stateT_run_bind, stateT_run_pure,
-        get_id_run_terminal, get_id_run_node, set_id_to_nid_nid, set_out_nid,
+        get_id_run_terminal, get_id_run_node, set_id_to_nid_nid, write_out_nid, advance_nid_nid,
         Fin.val_add_one]
       split
       · -- Wrapping case: nid = Fin.last m, but this contradicts hnid
@@ -1420,8 +1553,8 @@ private lemma process_record_iso {n m : Nat}
   refine ⟨?_, set_id_to_nid_nid j s, set_id_to_nid_out j s⟩
   first | rfl | trivial
 
--- In the new-key case of process_record, the output node written at the new nid
--- position has var = v[entry.2].var. This is the core fact for var tracking.
+-- In the new-key case of process_record, the output node written at the result nid
+-- (the write position = s.nid + 1) has var = v[entry.2].var.
 private lemma process_record_newkey_out_var {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (curkey : Pointer m.succ × Pointer m.succ)
@@ -1438,25 +1571,41 @@ private lemma process_record_newkey_out_var {n m : Nat}
     unfold process_record
     simp only [stateT_run_bind, get_id_run, hlow, hhigh, stateT_run_pure]
     simp only [hneq, ite_false]
-    simp only [set_out, set_id_to_nid, set_id, StateT.run, StateT.bind, Bind.bind,
+    simp only [advance_nid, write_out, set_id_to_nid, set_id, StateT.run, StateT.bind, Bind.bind,
       StateT.get, StateT.set, StateT.pure, get, set, pure, MonadState.get, getThe,
       MonadStateOf.get, MonadStateOf.set, Id.run, get_id]
-    -- Goal: (s.out.set pos node)[s.nid + 1].var = v[j].var
-    -- The write position (nid+1)%m.succ and read position (nid+1 as Fin) match.
-    simp only [Fin.getElem_fin, Vector.getElem_set]
-    split
-    · rfl
-    · next h =>
-      exfalso; apply h
-      rw [Fin.val_add_one]
-      split
-      · next heq => exfalso; rw [heq] at hnid; simp [Fin.val_last] at hnid
-      · exact Nat.mod_eq_of_lt (by omega : s.nid.val + 1 < m.succ)
+    -- Goal: (s.out.set (s.nid+1) node)[s.nid+1].var = v[j].var
+    simp only [Fin.getElem_fin, Vector.getElem_set_self]
+  )
+
+-- In the new-key case of process_record, the full output node at the result nid
+-- (the write position = s.nid + 1) is ⟨v[entry.2].var, resolve_id s (v[entry.2].low), resolve_id s (v[entry.2].high)⟩.
+private lemma process_record_newkey_out_node {n m : Nat}
+    (v : Vector (Node n.succ m.succ) m.succ)
+    (curkey : Pointer m.succ × Pointer m.succ)
+    (entry : (Pointer m.succ × Pointer m.succ) × Fin m.succ)
+    (s : State n.succ m.succ)
+    (hnid : s.nid.val < m)
+    (hneq : entry.1 ≠ curkey) :
+    let pr := StateT.run (process_record v curkey entry) s
+    pr.2.out[pr.2.nid] = ⟨v[entry.2].var, resolve_id s (v[entry.2].low), resolve_id s (v[entry.2].high)⟩ := by
+  obtain ⟨⟨key_low, key_high⟩, j⟩ := entry
+  simp only at hneq
+  rcases hlow : v[j].low with b1 | k1 <;> rcases hhigh : v[j].high with b2 | k2
+  all_goals (
+    unfold process_record
+    simp only [stateT_run_bind, get_id_run, hlow, hhigh, stateT_run_pure]
+    simp only [hneq, ite_false]
+    simp only [advance_nid, write_out, set_id_to_nid, set_id, StateT.run, StateT.bind, Bind.bind,
+      StateT.get, StateT.set, StateT.pure, get, set, pure, MonadState.get, getThe,
+      MonadStateOf.get, MonadStateOf.set, Id.run, get_id]
+    simp only [Fin.getElem_fin, Vector.getElem_set_self, resolve_id, hlow, hhigh]
   )
 
 -- process_queue preserves out[k] when k ≤ s.nid and s.nid + Q.length ≤ m.
 -- The queue-length bound ensures nid < m throughout processing, since each
 -- record increments nid by at most 1 and the queue shrinks by 1.
+-- In Option C, writes go to positions > s.nid (advance_nid first), so k ≤ s.nid is safe.
 private lemma process_queue_out_stable {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (curkey : Pointer m.succ × Pointer m.succ)
@@ -1485,8 +1634,10 @@ private lemma process_queue_out_stable {n m : Nat}
     · exact ih s₁.1 s₁.2 (Nat.le_trans hk hle) hbound'
     · exact process_record_out_stable v curkey head s k hk hnid
 
--- All output nodes written during process_queue (at positions strictly above s.nid
--- and at most s'.nid) have var = i, provided all queue entries have var = i.
+-- All output nodes written during process_queue (at positions > s.nid
+-- and ≤ final nid) have var = i, provided all queue entries have var = i.
+-- In Option C, each new-key record advances nid first, then writes at the new nid.
+-- So the written range is (s.nid, final_nid].
 private lemma process_queue_written_var {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (curkey : Pointer m.succ × Pointer m.succ)
@@ -1518,7 +1669,8 @@ private lemma process_queue_written_var {n m : Nat}
       have : (head :: tail).length = tail.length + 1 := List.length_cons ..
       omega
     by_cases hk_pr : k.val ≤ pr.2.nid.val
-    · -- k was written during process_record for head
+    · -- k = pr.2.nid was written during process_record for head
+      -- In the new-key case, pr.2.nid = s.nid + 1, write at pr.2.nid.
       have hneq : head.1 ≠ curkey := by
         intro heq
         have ⟨_, hnid_eq, _⟩ := process_record_iso v curkey head s heq
@@ -1529,7 +1681,7 @@ private lemma process_queue_written_var {n m : Nat}
         process_record_newkey_out_var v curkey head s hnid hneq
       have hvar_i : v[head.2].var = i := hvar_eq head (List.mem_cons_self ..)
       have hout_stable : (StateT.run (process_queue v pr.1 tail) pr.2).2.out[k] = pr.2.out[k] :=
-        process_queue_out_stable v pr.1 tail pr.2 k hk_pr hbound'
+        process_queue_out_stable v pr.1 tail pr.2 k (by omega) hbound'
       rw [hout_stable]
       have hk_fin : k = pr.2.nid := Fin.ext hk_eq
       subst hk_fin
@@ -1546,6 +1698,9 @@ private lemma process_queue_written_var {n m : Nat}
 -- The curkey condition handles the iso case: either iso is impossible
 -- (curkey.1 = curkey.2 with non-redundant entries) or the node at s.nid
 -- was written by a previous new-key entry with var = i.
+-- In Option C, process_record_ids_self gives ids[j] = node(result.nid).
+-- ISO case: result.nid = s.nid, hcurkey_or_var provides out[s.nid].var = i.
+-- New-key case: result.nid = s.nid+1, write at s.nid+1, out[s.nid+1].var = i.
 private lemma process_queue_entry_var_eq {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (curkey : Pointer m.succ × Pointer m.succ)
@@ -1584,7 +1739,7 @@ private lemma process_queue_entry_var_eq {n m : Nat}
       by_cases hiso : head.1 = curkey
       · have ⟨_, hnid_eq, hout_eq⟩ := process_record_iso v curkey head s hiso
         rw [← hpr_def] at hnid_eq hout_eq
-        simp only [hnid_eq, hout_eq]
+        simp only [hout_eq, hnid_eq]
         rcases hcurkey_or_var with hceq | hvar_nid
         · exfalso; exact hnonred head (List.mem_cons_self ..) (hiso ▸ hceq)
         · exact hvar_nid
@@ -1598,7 +1753,7 @@ private lemma process_queue_entry_var_eq {n m : Nat}
           have : node k = node pr.2.nid := by rw [← hfinal, hstable, hids_self]
           injection this
         subst hk
-        have hstab := process_queue_out_stable v pr.1 tail pr.2 pr.2.nid (le_refl _) hbound'
+        have hstab := process_queue_out_stable v pr.1 tail pr.2 pr.2.nid (by omega) hbound'
         exact (congrArg (·.var) hstab).trans hprop
       · -- tail changed ids[e.2]: ∃ e' ∈ tail with e'.2 = e.2
         have : ∃ e' ∈ tail, e'.2 = e.2 := by
@@ -1994,6 +2149,304 @@ private lemma transfer_correctness_via_heap_agree {n m : Nat}
       show q1 = q2
       exact hred_old.2 (show OBdd.SimilarRP ⟨⟨s_out_old, p⟩, hord_old⟩ ⟨q1, hq1_old⟩ ⟨q2, hq2_old⟩ from hsim_old)
 
+-- Helper: Given a heap where position `nid` contains a node whose children are
+-- correct (ordered, bounded, reduced) and whose var ordering holds,
+-- the BDD rooted at `node nid` is ordered, bounded, and reduced.
+-- The Reduced (SimilarRP) proof uses h_unique_below_nid: all nodes written
+-- to the heap below nid have unique tree representations.
+private lemma newkey_node_correct {n m : Nat}
+    (out : Vector (Node n.succ m.succ) m.succ)
+    (nid : Fin m.succ)
+    (low_ptr high_ptr : Pointer m.succ)
+    (hlow_eq : out[nid].low = low_ptr)
+    (hhigh_eq : out[nid].high = high_ptr)
+    (hnonred : low_ptr ≠ high_ptr)
+    (hchildren_low : (∃ b, low_ptr = terminal b) ∨
+        (∃ (hord : Bdd.Ordered {heap := out, root := low_ptr}),
+          (∀ j : Fin m.succ, Pointer.Reachable out low_ptr (.node j) → j.val < nid.val + 1) ∧
+          OBdd.Reduced ⟨{heap := out, root := low_ptr}, hord⟩))
+    (hchildren_high : (∃ b, high_ptr = terminal b) ∨
+        (∃ (hord : Bdd.Ordered {heap := out, root := high_ptr}),
+          (∀ j : Fin m.succ, Pointer.Reachable out high_ptr (.node j) → j.val < nid.val + 1) ∧
+          OBdd.Reduced ⟨{heap := out, root := high_ptr}, hord⟩))
+    (hmp_low : Pointer.MayPrecede out (node nid) low_ptr)
+    (hmp_high : Pointer.MayPrecede out (node nid) high_ptr)
+    (h_unique_below_nid : ∀ (i j : Fin m.succ),
+      i.val < nid.val → j.val < nid.val →
+      ∀ (hord_i : Bdd.Ordered {heap := out, root := node i})
+        (hord_j : Bdd.Ordered {heap := out, root := node j}),
+      (∀ k : Fin m.succ, Pointer.Reachable out (node i) (.node k) → k.val ≤ nid.val) →
+      (∀ k : Fin m.succ, Pointer.Reachable out (node j) (.node k) → k.val ≤ nid.val) →
+      OBdd.toTree ⟨{heap := out, root := node i}, hord_i⟩ =
+      OBdd.toTree ⟨{heap := out, root := node j}, hord_j⟩ →
+      i = j) :
+    (Bdd.Ordered {heap := out, root := node nid} ∧
+     (∀ j : Fin m.succ, Pointer.Reachable out (node nid) (.node j) → j.val < nid.val + 1) ∧
+     (∀ hord : Bdd.Ordered {heap := out, root := node nid},
+        OBdd.Reduced ⟨{heap := out, root := node nid}, hord⟩)) := by
+  -- === Ordered ===
+  have hord_low : Bdd.Ordered {heap := out, root := low_ptr} := by
+    rcases hchildren_low with ⟨b, hb⟩ | ⟨hord, _, _⟩
+    · rw [hb]; exact Bdd.Ordered_of_terminal
+    · exact hord
+  have hord_high : Bdd.Ordered {heap := out, root := high_ptr} := by
+    rcases hchildren_high with ⟨b, hb⟩ | ⟨hord, _, _⟩
+    · rw [hb]; exact Bdd.Ordered_of_terminal
+    · exact hord
+  have hord_root : Bdd.Ordered {heap := out, root := node nid} := by
+    apply Bdd.ordered_of_low_high_ordered (j := nid) rfl
+    · show Bdd.Ordered {heap := out, root := out[nid].low}
+      rw [hlow_eq]; exact hord_low
+    · -- B.var < (B.low rfl).var
+      -- This is MayPrecede out (node nid) out[nid].low after unfolding
+      change Pointer.toVar out (node nid) < Pointer.toVar out out[nid].low
+      rw [hlow_eq]; exact hmp_low
+    · show Bdd.Ordered {heap := out, root := out[nid].high}
+      rw [hhigh_eq]; exact hord_high
+    · change Pointer.toVar out (node nid) < Pointer.toVar out out[nid].high
+      rw [hhigh_eq]; exact hmp_high
+  -- Decompose reachability from the root into: root itself, or reachable from low/high child
+  have reach_decompose : ∀ (p : Pointer m.succ),
+      Pointer.Reachable out (node nid) p →
+      p = node nid ∨ Pointer.Reachable out low_ptr p ∨ Pointer.Reachable out high_ptr p := by
+    intro p hp
+    cases Relation.reflTransGen_swap.mp hp with
+    | refl => exact Or.inl rfl
+    | tail r e =>
+      -- e : Edge out (node nid) q (first step from root)
+      -- r : Reachable out q p (remaining path, reversed)
+      right
+      have hr := Relation.reflTransGen_swap.mpr r
+      cases e with
+      | low h =>
+        have hq := h.symm.trans hlow_eq  -- q = low_ptr
+        exact Or.inl (hq ▸ hr)
+      | high h =>
+        have hq := h.symm.trans hhigh_eq  -- q = high_ptr
+        exact Or.inr (hq ▸ hr)
+  -- === Bounded ===
+  have hbnd_root : ∀ j : Fin m.succ,
+      Pointer.Reachable out (node nid) (.node j) → j.val < nid.val + 1 := by
+    intro j hj
+    rcases reach_decompose (.node j) hj with h_eq | hreach_low | hreach_high
+    · have := Pointer.node.inj h_eq; omega
+    · rcases hchildren_low with ⟨b, hb⟩ | ⟨_, hbnd_l, _⟩
+      · exact absurd (Pointer.eq_terminal_of_reachable (hb ▸ hreach_low)) (by intro h; cases h)
+      · exact hbnd_l j hreach_low
+    · rcases hchildren_high with ⟨b, hb⟩ | ⟨_, hbnd_h, _⟩
+      · exact absurd (Pointer.eq_terminal_of_reachable (hb ▸ hreach_high)) (by intro h; cases h)
+      · exact hbnd_h j hreach_high
+  -- === Reduced ===
+  refine ⟨hord_root, hbnd_root, fun hord => ?_⟩
+  constructor
+  · -- NoRedundancy
+    intro ⟨p, hp⟩ hred_p
+    rcases reach_decompose p hp with rfl | hreach_low | hreach_high
+    · -- p = node nid: redundant means low = high, contradicts hnonred
+      cases hred_p with
+      | red h => rw [hlow_eq, hhigh_eq] at h; exact hnonred h
+    · rcases hchildren_low with ⟨b, hb⟩ | ⟨_, _, hred_l⟩
+      · -- p reachable from terminal b: p = terminal b, Redundant impossible
+        have := Pointer.eq_terminal_of_reachable (hb ▸ hreach_low)
+        subst this; exact (fun h => nomatch h) hred_p
+      · exact hred_l.1 ⟨p, hreach_low⟩ hred_p
+    · rcases hchildren_high with ⟨b, hb⟩ | ⟨_, _, hred_h⟩
+      · have := Pointer.eq_terminal_of_reachable (hb ▸ hreach_high)
+        subst this; exact (fun h => nomatch h) hred_p
+      · exact hred_h.1 ⟨p, hreach_high⟩ hred_p
+  · -- SimilarRP => same pointer
+    -- Uses h_unique_below_nid for the cross-child case.
+    -- Case analysis: (p from {nid, low, high}) x (q from {nid, low, high})
+    intro ⟨p, hp⟩ ⟨q, hq⟩ hsim
+    show p = q
+    -- hsim : toTree(out, p) = toTree(out, q) (after unfolding SimilarRP/Similar/HSimilar)
+    -- Helper: nid is not reachable from its own children (acyclicity of ordered BDDs)
+    have nid_not_from_low : ¬Pointer.Reachable out low_ptr (node nid) := by
+      intro habs
+      exact OBdd.not_oedge_reachable
+        (O := ⟨{heap := out, root := node nid}, hord_root⟩)
+        (U := ⟨{heap := out, root := low_ptr}, hord_low⟩)
+        ⟨rfl, show Edge out (node nid) low_ptr from hlow_eq ▸ Edge.low rfl⟩
+        habs
+    have nid_not_from_high : ¬Pointer.Reachable out high_ptr (node nid) := by
+      intro habs
+      exact OBdd.not_oedge_reachable
+        (O := ⟨{heap := out, root := node nid}, hord_root⟩)
+        (U := ⟨{heap := out, root := high_ptr}, hord_high⟩)
+        ⟨rfl, show Edge out (node nid) high_ptr from hhigh_eq ▸ Edge.high rfl⟩
+        habs
+    -- Helper: for node j reachable from a child, j.val < nid.val (strict)
+    have node_from_low_lt : ∀ j : Fin m.succ,
+        Pointer.Reachable out low_ptr (node j) → j.val < nid.val := by
+      intro j hj
+      have hle := hbnd_root j (Relation.ReflTransGen.head (hlow_eq ▸ Edge.low rfl) hj)
+      rcases Nat.lt_or_eq_of_le (Nat.lt_add_one_iff.mp hle) with h | h
+      · exact h
+      · exfalso; exact nid_not_from_low (Fin.ext h ▸ hj)
+    have node_from_high_lt : ∀ j : Fin m.succ,
+        Pointer.Reachable out high_ptr (node j) → j.val < nid.val := by
+      intro j hj
+      have hle := hbnd_root j (Relation.ReflTransGen.head (hhigh_eq ▸ Edge.high rfl) hj)
+      rcases Nat.lt_or_eq_of_le (Nat.lt_add_one_iff.mp hle) with h | h
+      · exact h
+      · exfalso; exact nid_not_from_high (Fin.ext h ▸ hj)
+    -- Helper: build TransGen from nid to any descendant reachable from a child
+    have transGen_of_low : ∀ j, Pointer.Reachable out low_ptr j →
+        Relation.TransGen (Edge out) (node nid) j := by
+      intro j hj
+      have h := Relation.ReflTransGen.head (show Edge out (node nid) low_ptr from hlow_eq ▸ Edge.low rfl) hj
+      rcases Relation.reflTransGen_iff_eq_or_transGen.mp h with rfl | htrans
+      · exact absurd hj nid_not_from_low
+      · exact htrans
+    have transGen_of_high : ∀ j, Pointer.Reachable out high_ptr j →
+        Relation.TransGen (Edge out) (node nid) j := by
+      intro j hj
+      have h := Relation.ReflTransGen.head (show Edge out (node nid) high_ptr from hhigh_eq ▸ Edge.high rfl) hj
+      rcases Relation.reflTransGen_iff_eq_or_transGen.mp h with rfl | htrans
+      · exact absurd hj nid_not_from_high
+      · exact htrans
+    -- Helper: toTree(nid) ≠ toTree(strict descendant) by var ordering
+    have nid_tree_ne_desc : ∀ j : Pointer m.succ,
+        Relation.TransGen (Edge out) (node nid) j →
+        ∀ (hord_j : Bdd.Ordered {heap := out, root := j}),
+        OBdd.toTree ⟨{heap := out, root := node nid}, hord_root⟩ ≠
+        OBdd.toTree ⟨{heap := out, root := j}, hord_j⟩ := by
+      intro j htrans hord_j heq
+      have hvar_lt := Pointer.toVar_lt_of_trans_edge_of_ordered hord_root htrans
+      cases j with
+      | terminal b =>
+        rw [OBdd.toTree_node rfl, OBdd.toTree_terminal] at heq
+        exact absurd heq nofun
+      | node k =>
+        rw [OBdd.toTree_node (O := ⟨_, hord_root⟩) rfl,
+            OBdd.toTree_node (O := ⟨_, hord_j⟩) rfl] at heq
+        have hvar_eq := (DecisionTree.branch.injEq _ _ _ _ _ _).mp heq |>.1
+        simp only [Pointer.toVar, Fin.lt_def] at hvar_lt
+        exact absurd (congrArg Fin.val hvar_eq) (Nat.ne_of_lt hvar_lt)
+    -- Main 3x3 case analysis
+    rcases reach_decompose p hp with rfl | hreach_low_p | hreach_high_p
+    · -- p = node nid
+      rcases reach_decompose q hq with rfl | hreach_low_q | hreach_high_q
+      · rfl
+      · exact absurd hsim (nid_tree_ne_desc q (transGen_of_low q hreach_low_q)
+            (Bdd.ordered_of_reachable hq))
+      · exact absurd hsim (nid_tree_ne_desc q (transGen_of_high q hreach_high_q)
+            (Bdd.ordered_of_reachable hq))
+    · -- p reachable from low_ptr
+      rcases reach_decompose q hq with rfl | hreach_low_q | hreach_high_q
+      · exact absurd hsim.symm (nid_tree_ne_desc p (transGen_of_low p hreach_low_p)
+            (Bdd.ordered_of_reachable hp))
+      · -- Both from low: delegate to child's Reduced
+        rcases hchildren_low with ⟨b, hb⟩ | ⟨hord_l_sub, _, hred_l⟩
+        · have hp_eq := Pointer.eq_terminal_of_reachable
+            (show Pointer.Reachable out (terminal b) p by rw [← hb]; exact hreach_low_p)
+          have hq_eq := Pointer.eq_terminal_of_reachable
+            (show Pointer.Reachable out (terminal b) q by rw [← hb]; exact hreach_low_q)
+          rw [hp_eq, hq_eq]
+        · exact hred_l.2 (show OBdd.SimilarRP ⟨{heap := out, root := low_ptr}, hord_l_sub⟩
+              ⟨p, hreach_low_p⟩ ⟨q, hreach_low_q⟩ from hsim)
+      · -- Cross-child: p from low, q from high
+        cases p with
+        | terminal bp =>
+          cases q with
+          | terminal bq =>
+            simp only [OBdd.SimilarRP, OBdd.Similar, OBdd.HSimilar] at hsim
+            rw [OBdd.toTree_terminal, OBdd.toTree_terminal] at hsim
+            exact congrArg terminal (DecisionTree.leaf.inj hsim)
+          | node j =>
+            simp only [OBdd.SimilarRP, OBdd.Similar, OBdd.HSimilar] at hsim
+            rw [OBdd.toTree_terminal, OBdd.toTree_node rfl] at hsim
+            exact absurd hsim nofun
+        | node i =>
+          cases q with
+          | terminal bq =>
+            simp only [OBdd.SimilarRP, OBdd.Similar, OBdd.HSimilar] at hsim
+            rw [OBdd.toTree_node rfl, OBdd.toTree_terminal] at hsim
+            exact absurd hsim nofun
+          | node j =>
+            -- Strengthen reachability bounds from ≤ nid to < nid using acyclicity
+            have hbnd_i : ∀ k : Fin m.succ, Pointer.Reachable out (node i) (.node k) →
+                k.val < nid.val := by
+              intro k hk
+              have hk_from_low := hreach_low_p.trans hk
+              rcases hchildren_low with ⟨b, hb⟩ | ⟨_, hbnd_l, _⟩
+              · exact absurd (Pointer.eq_terminal_of_reachable (hb ▸ hreach_low_p)) (by intro h; cases h)
+              · have hle := Nat.lt_add_one_iff.mp (hbnd_l k hk_from_low)
+                rcases Nat.lt_or_eq_of_le hle with h | h
+                · exact h
+                · exfalso; exact nid_not_from_low (Fin.ext h ▸ hk_from_low)
+            have hbnd_j : ∀ k : Fin m.succ, Pointer.Reachable out (node j) (.node k) →
+                k.val < nid.val := by
+              intro k hk
+              have hk_from_high := hreach_high_q.trans hk
+              rcases hchildren_high with ⟨b, hb⟩ | ⟨_, hbnd_h, _⟩
+              · exact absurd (Pointer.eq_terminal_of_reachable (hb ▸ hreach_high_q)) (by intro h; cases h)
+              · have hle := Nat.lt_add_one_iff.mp (hbnd_h k hk_from_high)
+                rcases Nat.lt_or_eq_of_le hle with h | h
+                · exact h
+                · exfalso; exact nid_not_from_high (Fin.ext h ▸ hk_from_high)
+            exact congrArg node (h_unique_below_nid i j
+              (node_from_low_lt i hreach_low_p) (node_from_high_lt j hreach_high_q)
+              (Bdd.ordered_of_reachable hp) (Bdd.ordered_of_reachable hq)
+              (fun k hk => Nat.le_of_lt (hbnd_i k hk)) (fun k hk => Nat.le_of_lt (hbnd_j k hk)) hsim)
+    · -- p reachable from high_ptr
+      rcases reach_decompose q hq with rfl | hreach_low_q | hreach_high_q
+      · exact absurd hsim.symm (nid_tree_ne_desc p (transGen_of_high p hreach_high_p)
+            (Bdd.ordered_of_reachable hp))
+      · -- Cross-child: p from high, q from low
+        cases p with
+        | terminal bp =>
+          cases q with
+          | terminal bq =>
+            simp only [OBdd.SimilarRP, OBdd.Similar, OBdd.HSimilar] at hsim
+            rw [OBdd.toTree_terminal, OBdd.toTree_terminal] at hsim
+            exact congrArg terminal (DecisionTree.leaf.inj hsim)
+          | node j =>
+            simp only [OBdd.SimilarRP, OBdd.Similar, OBdd.HSimilar] at hsim
+            rw [OBdd.toTree_terminal, OBdd.toTree_node rfl] at hsim
+            exact absurd hsim nofun
+        | node i =>
+          cases q with
+          | terminal bq =>
+            simp only [OBdd.SimilarRP, OBdd.Similar, OBdd.HSimilar] at hsim
+            rw [OBdd.toTree_node rfl, OBdd.toTree_terminal] at hsim
+            exact absurd hsim nofun
+          | node j =>
+            -- Strengthen reachability bounds from ≤ nid to < nid using acyclicity
+            have hbnd_i : ∀ k : Fin m.succ, Pointer.Reachable out (node i) (.node k) →
+                k.val < nid.val := by
+              intro k hk
+              have hk_from_high := hreach_high_p.trans hk
+              rcases hchildren_high with ⟨b, hb⟩ | ⟨_, hbnd_h, _⟩
+              · exact absurd (Pointer.eq_terminal_of_reachable (hb ▸ hreach_high_p)) (by intro h; cases h)
+              · have hle := Nat.lt_add_one_iff.mp (hbnd_h k hk_from_high)
+                rcases Nat.lt_or_eq_of_le hle with h | h
+                · exact h
+                · exfalso; exact nid_not_from_high (Fin.ext h ▸ hk_from_high)
+            have hbnd_j : ∀ k : Fin m.succ, Pointer.Reachable out (node j) (.node k) →
+                k.val < nid.val := by
+              intro k hk
+              have hk_from_low := hreach_low_q.trans hk
+              rcases hchildren_low with ⟨b, hb⟩ | ⟨_, hbnd_l, _⟩
+              · exact absurd (Pointer.eq_terminal_of_reachable (hb ▸ hreach_low_q)) (by intro h; cases h)
+              · have hle := Nat.lt_add_one_iff.mp (hbnd_l k hk_from_low)
+                rcases Nat.lt_or_eq_of_le hle with h | h
+                · exact h
+                · exfalso; exact nid_not_from_low (Fin.ext h ▸ hk_from_low)
+            exact congrArg node (h_unique_below_nid i j
+              (node_from_high_lt i hreach_high_p) (node_from_low_lt j hreach_low_q)
+              (Bdd.ordered_of_reachable hp) (Bdd.ordered_of_reachable hq)
+              (fun k hk => Nat.le_of_lt (hbnd_i k hk)) (fun k hk => Nat.le_of_lt (hbnd_j k hk)) hsim)
+      · -- Both from high: delegate to child's Reduced
+        rcases hchildren_high with ⟨b, hb⟩ | ⟨hord_h_sub, _, hred_h⟩
+        · have hp_eq := Pointer.eq_terminal_of_reachable
+            (show Pointer.Reachable out (terminal b) p by rw [← hb]; exact hreach_high_p)
+          have hq_eq := Pointer.eq_terminal_of_reachable
+            (show Pointer.Reachable out (terminal b) q by rw [← hb]; exact hreach_high_q)
+          rw [hp_eq, hq_eq]
+        · exact hred_h.2 (show OBdd.SimilarRP ⟨{heap := out, root := high_ptr}, hord_h_sub⟩
+              ⟨p, hreach_high_p⟩ ⟨q, hreach_high_q⟩ from hsim)
+
 -- After process_queue, for every entry (_, k) in Q, ids[k] is non-terminal
 -- and the subtree at ids[k] in the output heap is ordered, bounded, and reduced.
 -- This is the main correctness lemma for process_queue and is the heart of the
@@ -2007,6 +2460,7 @@ private lemma transfer_correctness_via_heap_agree {n m : Nat}
 -- - hcurkey_ok: if curkey matches an entry's key, then node(nid) already has a correct subtree
 --   (this tracks the isomorphism invariant: consecutive entries with same key share one output node)
 -- - hvar_lt_child: the var ordering between parent and children is preserved in the output heap
+set_option maxHeartbeats 800000 in
 private lemma process_queue_entry_ok {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ)
     (curkey : Pointer m.succ × Pointer m.succ)
@@ -2027,7 +2481,23 @@ private lemma process_queue_entry_ok {n m : Nat}
           OBdd.Reduced ⟨{heap := s.out, root := node s.nid}, hord⟩)))
     (hvar_lt_child : ∀ entry ∈ Q, ∀ k : Fin m.succ,
         (entry.1.1 = node k ∨ entry.1.2 = node k) →
-        v[entry.2].var.val < s.out[k].var.val) :
+        v[entry.2].var.val < s.out[k].var.val)
+    (hkey_match : ∀ entry ∈ Q,
+        entry.1 = (resolve_id s (v[entry.2].low), resolve_id s (v[entry.2].high)))
+    (hchildren_disjoint : ∀ e ∈ Q, ∀ c : Fin m.succ,
+        (v[e.2].low = node c ∨ v[e.2].high = node c) → ∀ e' ∈ Q, e'.2 ≠ c)
+    (h_heap_closed : ∀ (j : Fin m.succ), j.val ≤ s.nid.val →
+      (∀ k : Fin m.succ, s.out[j].low = node k → k.val ≤ s.nid.val) ∧
+      (∀ k : Fin m.succ, s.out[j].high = node k → k.val ≤ s.nid.val))
+    (h_unique_below_nid : ∀ (i j : Fin m.succ),
+      i.val < s.nid.val → j.val < s.nid.val →
+      ∀ (hord_i : Bdd.Ordered {heap := s.out, root := node i})
+        (hord_j : Bdd.Ordered {heap := s.out, root := node j}),
+      (∀ k : Fin m.succ, Pointer.Reachable s.out (node i) (.node k) → k.val ≤ s.nid.val) →
+      (∀ k : Fin m.succ, Pointer.Reachable s.out (node j) (.node k) → k.val ≤ s.nid.val) →
+      OBdd.toTree ⟨{heap := s.out, root := node i}, hord_i⟩ =
+      OBdd.toTree ⟨{heap := s.out, root := node j}, hord_j⟩ →
+      i = j) :
     let s' := (StateT.run (process_queue v curkey Q) s).2
     ∀ entry ∈ Q, (¬∃ b, s'.ids[entry.2] = terminal b) →
       (Bdd.Ordered {heap := s'.out, root := s'.ids[entry.2]} ∧
@@ -2091,6 +2561,246 @@ private lemma process_queue_entry_ok {n m : Nat}
         have hout_eq : pr.2.out[k] = s.out[k] := by
           simp only [pr]; exact process_record_out_stable v curkey head s k hk_le hnid_lt_m
         simp only [hout_eq]; exact hvlt
+    -- Transfer hkey_match to tail with state pr.2
+    have hkey_match_tail : ∀ e ∈ tail,
+        e.1 = (resolve_id pr.2 (v[e.2].low), resolve_id pr.2 (v[e.2].high)) := by
+      intro e he_tail
+      have he_cons : e ∈ head :: tail := List.mem_cons_of_mem _ he_tail
+      have hkm := hkey_match e he_cons
+      -- Show resolve_id pr.2 = resolve_id s for children of e
+      have hlow_eq : resolve_id pr.2 (v[e.2].low) = resolve_id s (v[e.2].low) := by
+        cases hc : v[e.2].low with
+        | terminal => simp only [resolve_id]
+        | node c =>
+          simp only [resolve_id]
+          have hne : head.2 ≠ c :=
+            hchildren_disjoint e he_cons c (Or.inl hc) head (List.mem_cons_self ..)
+          have := process_record_ids_ne v curkey head c hne s
+          simp only [pr] at this ⊢; exact this
+      have hhigh_eq : resolve_id pr.2 (v[e.2].high) = resolve_id s (v[e.2].high) := by
+        cases hc : v[e.2].high with
+        | terminal => simp only [resolve_id]
+        | node c =>
+          simp only [resolve_id]
+          have hne : head.2 ≠ c :=
+            hchildren_disjoint e he_cons c (Or.inr hc) head (List.mem_cons_self ..)
+          have := process_record_ids_ne v curkey head c hne s
+          simp only [pr] at this ⊢; exact this
+      rw [hlow_eq, hhigh_eq]; exact hkm
+    -- Transfer hchildren_disjoint to tail
+    have hchildren_disjoint_tail : ∀ e ∈ tail, ∀ c : Fin m.succ,
+        (v[e.2].low = node c ∨ v[e.2].high = node c) → ∀ e' ∈ tail, e'.2 ≠ c := by
+      intro e he c hc e' he'
+      exact hchildren_disjoint e (List.mem_cons_of_mem _ he) c hc e' (List.mem_cons_of_mem _ he')
+    -- Transfer heap_closed_below from s to pr.2
+    -- In Option C, new-key writes at pr.2.nid (= s.nid + 1). Positions ≤ s.nid are unchanged.
+    -- h_heap_closed covers j ≤ s.nid. The new-key write at s.nid+1 has bounded children
+    -- from hchildren_ok. So we can cover j ≤ pr.2.nid for the IH.
+    have h_heap_closed_pr : ∀ (j : Fin m.succ), j.val ≤ pr.2.nid.val →
+        (∀ k : Fin m.succ, pr.2.out[j].low = node k → k.val ≤ pr.2.nid.val) ∧
+        (∀ k : Fin m.succ, pr.2.out[j].high = node k → k.val ≤ pr.2.nid.val) := by
+      by_cases hiso_head_c : head.1 = curkey
+      · -- ISO case: pr.2 = s with same nid and out
+        have ⟨_, hnid_eq, hout_eq⟩ := process_record_iso v curkey head s hiso_head_c
+        intro j hj
+        rw [show pr.2.nid = s.nid from hnid_eq] at hj
+        rw [show pr.2.nid = s.nid from hnid_eq, show pr.2.out = s.out from hout_eq]
+        exact h_heap_closed j hj
+      · -- NEW-KEY case: pr.2.nid = s.nid + 1, pr.2.out writes at s.nid + 1
+        have hnid_ge : s.nid.val ≤ pr.2.nid.val := by
+          simp only [pr]; exact process_record_nid_val_ge v curkey head s hnid_lt_m
+        have hnid_le : pr.2.nid.val ≤ s.nid.val + 1 := by
+          simp only [pr]; exact process_record_nid_val_le_succ v curkey head s hnid_lt_m
+        intro j hj
+        rcases Nat.lt_or_eq_of_le (show j.val ≤ s.nid.val + 1 by omega) with hj_lt_succ | hj_eq_succ
+        · -- j ≤ s.nid: pr.2.out[j] = s.out[j] (unchanged), edges bounded by ≤ s.nid ≤ pr.2.nid
+          have hj_le : j.val ≤ s.nid.val := by omega
+          have hout_eq : pr.2.out[j] = s.out[j] := by
+            simp only [pr]; exact process_record_out_stable v curkey head s j hj_le hnid_lt_m
+          have ⟨hlow, hhigh⟩ := h_heap_closed j hj_le
+          constructor
+          · intro k hk; rw [hout_eq] at hk; have := hlow k hk; omega
+          · intro k hk; rw [hout_eq] at hk; have := hhigh k hk; omega
+        · -- j = s.nid + 1 = pr.2.nid: the newly written node, edges are resolve_id s children
+          have hnode := process_record_newkey_out_node v curkey head s hnid_lt_m hiso_head_c
+          simp only [pr] at hnode
+          have hj_fin : j = pr.2.nid := Fin.ext (by omega)
+          have hlow_eq : pr.2.out[j].low = resolve_id s (v[head.2].low) := by
+            have := congrArg Node.low hnode
+            simp only at this
+            exact hj_fin ▸ this
+          have hhigh_eq : pr.2.out[j].high = resolve_id s (v[head.2].high) := by
+            have := congrArg Node.high hnode
+            simp only at this
+            exact hj_fin ▸ this
+          constructor
+          · intro k hk
+            rw [hlow_eq] at hk
+            have hkm := hkey_match head (List.mem_cons_self ..)
+            have : head.1.1 = resolve_id s (v[head.2].low) := congrArg Prod.fst hkm
+            rw [← this] at hk
+            rcases hchildren_ok head (List.mem_cons_self ..) (node k) (Or.inl hk.symm) with
+              ⟨_, habs⟩ | ⟨_, hbnd, _⟩
+            · cases habs
+            · have := hbnd k Relation.ReflTransGen.refl; omega
+          · intro k hk
+            rw [hhigh_eq] at hk
+            have hkm := hkey_match head (List.mem_cons_self ..)
+            have : head.1.2 = resolve_id s (v[head.2].high) := congrArg Prod.snd hkm
+            rw [← this] at hk
+            rcases hchildren_ok head (List.mem_cons_self ..) (node k) (Or.inr hk.symm) with
+              ⟨_, habs⟩ | ⟨_, hbnd, _⟩
+            · cases habs
+            · have := hbnd k Relation.ReflTransGen.refl; omega
+    -- Transfer uniqueness below nid from s to pr.2
+    have h_unique_below_pr_nid : ∀ (i j : Fin m.succ),
+        i.val < pr.2.nid.val → j.val < pr.2.nid.val →
+        ∀ (hord_i : Bdd.Ordered {heap := pr.2.out, root := node i})
+          (hord_j : Bdd.Ordered {heap := pr.2.out, root := node j}),
+        (∀ k : Fin m.succ, Pointer.Reachable pr.2.out (node i) (.node k) → k.val ≤ pr.2.nid.val) →
+        (∀ k : Fin m.succ, Pointer.Reachable pr.2.out (node j) (.node k) → k.val ≤ pr.2.nid.val) →
+        OBdd.toTree ⟨{heap := pr.2.out, root := node i}, hord_i⟩ =
+        OBdd.toTree ⟨{heap := pr.2.out, root := node j}, hord_j⟩ →
+        i = j := by
+      -- Case split on iso vs new-key
+      by_cases hiso_head : head.1 = curkey
+      · -- ISO case: pr.2.nid = s.nid and pr.2.out = s.out, so uniqueness transfers directly
+        have ⟨_, hnid_eq, hout_eq⟩ := process_record_iso v curkey head s hiso_head
+        change pr.2.nid = s.nid at hnid_eq
+        change pr.2.out = s.out at hout_eq
+        intro i' j' hi' hj' hord_i' hord_j' hbnd_i' hbnd_j' htree_eq
+        -- Transfer from pr.2.out to s.out using heap agreement (heaps are equal)
+        have hagree_all : ∀ k : Fin m.succ, s.out[k] = pr.2.out[k] :=
+          fun k => congrFun (congrArg Vector.get hout_eq.symm) k
+        have hagree_i : ∀ k : Fin m.succ, Pointer.Reachable pr.2.out (node i') (.node k) →
+            s.out[k] = pr.2.out[k] := fun k _ => hagree_all k
+        have hagree_j : ∀ k : Fin m.succ, Pointer.Reachable pr.2.out (node j') (.node k) →
+            s.out[k] = pr.2.out[k] := fun k _ => hagree_all k
+        have hord_i_s : Bdd.Ordered {heap := s.out, root := node i'} :=
+          ordered_of_heap_agree_on_reachable ⟨⟨pr.2.out, node i'⟩, hord_i'⟩ s.out hagree_i
+        have hord_j_s : Bdd.Ordered {heap := s.out, root := node j'} :=
+          ordered_of_heap_agree_on_reachable ⟨⟨pr.2.out, node j'⟩, hord_j'⟩ s.out hagree_j
+        have htree_i : OBdd.toTree ⟨⟨s.out, node i'⟩, hord_i_s⟩ =
+            OBdd.toTree ⟨⟨pr.2.out, node i'⟩, hord_i'⟩ :=
+          toTree_eq_of_heap_agree ⟨⟨pr.2.out, node i'⟩, hord_i'⟩ s.out hord_i_s hagree_i
+        have htree_j : OBdd.toTree ⟨⟨s.out, node j'⟩, hord_j_s⟩ =
+            OBdd.toTree ⟨⟨pr.2.out, node j'⟩, hord_j'⟩ :=
+          toTree_eq_of_heap_agree ⟨⟨pr.2.out, node j'⟩, hord_j'⟩ s.out hord_j_s hagree_j
+        have htree_s : OBdd.toTree ⟨⟨s.out, node i'⟩, hord_i_s⟩ =
+            OBdd.toTree ⟨⟨s.out, node j'⟩, hord_j_s⟩ := by
+          rw [htree_i, htree_j]; exact htree_eq
+        have hbnd_i_s : ∀ k : Fin m.succ, Pointer.Reachable s.out (node i') (.node k) →
+            k.val ≤ s.nid.val := by
+          intro k hk; rw [hnid_eq] at hbnd_i'; exact hbnd_i' k (reachable_of_heap_agree hagree_i hk)
+        have hbnd_j_s : ∀ k : Fin m.succ, Pointer.Reachable s.out (node j') (.node k) →
+            k.val ≤ s.nid.val := by
+          intro k hk; rw [hnid_eq] at hbnd_j'; exact hbnd_j' k (reachable_of_heap_agree hagree_j hk)
+        rw [hnid_eq] at hi' hj'
+        exact h_unique_below_nid i' j' hi' hj' hord_i_s hord_j_s hbnd_i_s hbnd_j_s htree_s
+      · -- NEW-KEY case: pr.2.nid.val = s.nid.val + 1
+        -- Positions < pr.2.nid are ≤ s.nid. For positions < s.nid, transfer to s.out and
+        -- apply h_unique_below_nid. For position = s.nid, derive contradiction from uniqueness.
+        intro i' j' hi' hj' hord_i' hord_j' hbnd_i' hbnd_j' htree_eq
+        have hnid_le : pr.2.nid.val ≤ s.nid.val + 1 := by
+          simp only [pr]; exact process_record_nid_val_le_succ v curkey head s hnid_lt_m
+        have hnid_ge : s.nid.val ≤ pr.2.nid.val := by
+          simp only [pr]; exact process_record_nid_val_ge v curkey head s hnid_lt_m
+        have hi'_le : i'.val ≤ s.nid.val := by omega
+        have hj'_le : j'.val ≤ s.nid.val := by omega
+        -- For positions p < s.nid, all reachable nodes in pr.2.out are at positions < s.nid.
+        -- Uses h_heap_closed (edges from j < s.nid go to < s.nid in s.out) and
+        -- process_record_out_stable (pr.2.out[j] = s.out[j] for j < s.nid).
+        -- Proof by strong induction on the ReflTransGen path length, using the
+        -- bound from hbnd_i'/hbnd_j' to ensure well-foundedness.
+        have reachable_below_nid : ∀ (p : Fin m.succ), p.val ≤ s.nid.val →
+            ∀ (target : Pointer m.succ), Pointer.Reachable pr.2.out (node p) target →
+            ∀ k : Fin m.succ, target = node k → k.val ≤ s.nid.val := by
+          intro p hp target hreach
+          induction hreach with
+          | refl => intro k hk; exact Pointer.node.inj hk ▸ hp
+          | tail _hreach hedge ih =>
+            intro k hk
+            rename_i q _
+            -- The intermediate node q: case split on terminal/node
+            match q with
+            | .terminal b =>
+              -- Edge from terminal is impossible
+              exact absurd hedge (not_terminal_edge)
+            | .node j =>
+              -- j ≤ s.nid from IH (applied to q = node j)
+              have hj_le : j.val ≤ s.nid.val := ih j rfl
+              -- pr.2.out[j] = s.out[j] since j ≤ s.nid
+              have hout_eq : pr.2.out[j] = s.out[j] := by
+                simp only [pr]; exact process_record_out_stable v curkey head s j hj_le hnid_lt_m
+              -- Edge from j to target: pr.2.out[j].low = target or .high = target
+              have ⟨hcl_low, hcl_high⟩ := h_heap_closed j hj_le
+              subst hk -- target = node k
+              cases hedge with
+              | low h =>
+                have : s.out[j].low = node k := (congrArg Node.low hout_eq).symm.trans h
+                have := hcl_low k this; omega
+              | high h =>
+                have : s.out[j].high = node k := (congrArg Node.high hout_eq).symm.trans h
+                have := hcl_high k this; omega
+        -- Case split on whether i', j' are < s.nid or = s.nid
+        rcases Nat.lt_or_eq_of_le hi'_le with hi_lt | hi_eq
+        · -- i' < s.nid
+          rcases Nat.lt_or_eq_of_le hj'_le with hj_lt | hj_eq
+          · -- Both < s.nid: transfer to s.out and apply h_unique_below_nid
+            have hbnd_i_le : ∀ k : Fin m.succ,
+                Pointer.Reachable pr.2.out (node i') (.node k) → k.val ≤ s.nid.val :=
+              fun k hk => reachable_below_nid i' (Nat.le_of_lt hi_lt) (.node k) hk k rfl
+            have hbnd_j_le : ∀ k : Fin m.succ,
+                Pointer.Reachable pr.2.out (node j') (.node k) → k.val ≤ s.nid.val :=
+              fun k hk => reachable_below_nid j' (Nat.le_of_lt hj_lt) (.node k) hk k rfl
+            -- Heap agreement: s.out[k] = pr.2.out[k] for positions ≤ s.nid
+            have hagree_i : ∀ k : Fin m.succ, Pointer.Reachable pr.2.out (node i') (.node k) →
+                s.out[k] = pr.2.out[k] := by
+              intro k hk
+              symm; simp only [pr]
+              exact process_record_out_stable v curkey head s k (hbnd_i_le k hk) hnid_lt_m
+            have hagree_j : ∀ k : Fin m.succ, Pointer.Reachable pr.2.out (node j') (.node k) →
+                s.out[k] = pr.2.out[k] := by
+              intro k hk
+              symm; simp only [pr]
+              exact process_record_out_stable v curkey head s k (hbnd_j_le k hk) hnid_lt_m
+            -- Transfer ordering to s.out
+            have hord_i_s : Bdd.Ordered {heap := s.out, root := node i'} :=
+              ordered_of_heap_agree_on_reachable ⟨⟨pr.2.out, node i'⟩, hord_i'⟩ s.out hagree_i
+            have hord_j_s : Bdd.Ordered {heap := s.out, root := node j'} :=
+              ordered_of_heap_agree_on_reachable ⟨⟨pr.2.out, node j'⟩, hord_j'⟩ s.out hagree_j
+            -- Transfer tree equality to s.out
+            have htree_i : OBdd.toTree ⟨⟨s.out, node i'⟩, hord_i_s⟩ =
+                OBdd.toTree ⟨⟨pr.2.out, node i'⟩, hord_i'⟩ :=
+              toTree_eq_of_heap_agree ⟨⟨pr.2.out, node i'⟩, hord_i'⟩ s.out hord_i_s hagree_i
+            have htree_j : OBdd.toTree ⟨⟨s.out, node j'⟩, hord_j_s⟩ =
+                OBdd.toTree ⟨⟨pr.2.out, node j'⟩, hord_j'⟩ :=
+              toTree_eq_of_heap_agree ⟨⟨pr.2.out, node j'⟩, hord_j'⟩ s.out hord_j_s hagree_j
+            have htree_s : OBdd.toTree ⟨⟨s.out, node i'⟩, hord_i_s⟩ =
+                OBdd.toTree ⟨⟨s.out, node j'⟩, hord_j_s⟩ := by
+              rw [htree_i, htree_j]; exact htree_eq
+            -- Transfer reachability bounds to s.out
+            have hbnd_i_s : ∀ k : Fin m.succ, Pointer.Reachable s.out (node i') (.node k) →
+                k.val ≤ s.nid.val := by
+              intro k hk
+              exact hbnd_i_le k (reachable_of_heap_agree hagree_i hk)
+            have hbnd_j_s : ∀ k : Fin m.succ, Pointer.Reachable s.out (node j') (.node k) →
+                k.val ≤ s.nid.val := by
+              intro k hk
+              exact hbnd_j_le k (reachable_of_heap_agree hagree_j hk)
+            exact h_unique_below_nid i' j' hi_lt hj_lt hord_i_s hord_j_s
+              hbnd_i_s hbnd_j_s htree_s
+          · -- i' < s.nid, j' = s.nid: gap case
+            -- Requires showing trees at old (< s.nid) vs new (= s.nid) positions differ.
+            -- The node at s.nid was freshly written; needs heap_closed_below invariant
+            -- to formalize why no existing node below s.nid has the same tree.
+            sorry
+        · -- i' = s.nid
+          rcases Nat.lt_or_eq_of_le hj'_le with hj_lt | hj_eq
+          · -- i' = s.nid, j' < s.nid: symmetric gap case
+            sorry
+          · -- Both = s.nid: trivially equal
+            exact Fin.ext (by omega)
     -- Isomorphism invariant for tail
     have hcurkey_ok_tail : (∃ e ∈ tail, e.1 = pr.1) →
       (Bdd.Ordered {heap := pr.2.out, root := node pr.2.nid} ∧
@@ -2106,14 +2816,341 @@ private lemma process_queue_entry_ok {n m : Nat}
         intro ⟨e, he, heq⟩
         exact hcurkey_ok ⟨e, List.mem_cons_of_mem _ he, heq⟩
       · -- New key: process_record writes a new output node
-        sorry
+        -- In the new-key case, pr.1 = head.1 and pr.2.nid = s.nid + 1
+        -- The node at pr.2.nid has var = v[head.2].var, low = head.1.1, high = head.1.2
+        -- by hkey_match and the definition of process_record
+        intro ⟨e_tail, _he_in_tail, _he_key⟩
+        -- Get that the written node's children are head.1.1 and head.1.2
+        have hkm_head := hkey_match head (List.mem_cons_self ..)
+        -- The written node's low = resolve_id s v[head.2].low = head.1.1
+        have hhead_low : head.1.1 = resolve_id s (v[head.2].low) := by
+          have := congrArg Prod.fst hkm_head; exact this
+        have hhead_high : head.1.2 = resolve_id s (v[head.2].high) := by
+          have := congrArg Prod.snd hkm_head; exact this
+        -- Get children's correctness in s.out
+        have hchildren_low := hchildren_ok head (List.mem_cons_self ..) head.1.1 (Or.inl rfl)
+        have hchildren_high := hchildren_ok head (List.mem_cons_self ..) head.1.2 (Or.inr rfl)
+        -- Transfer children to pr.2.out
+        -- Children are bounded by < s.nid + 1, and process_record writes at s.nid+1,
+        -- so all children's reachable nodes are stable (positions ≤ s.nid are unchanged)
+        have hchildren_low_pr : (∃ b, head.1.1 = terminal b) ∨
+            (∃ (hord : Bdd.Ordered {heap := pr.2.out, root := head.1.1}),
+              (∀ j : Fin m.succ, Pointer.Reachable pr.2.out head.1.1 (.node j) → j.val < pr.2.nid.val + 1) ∧
+              OBdd.Reduced ⟨{heap := pr.2.out, root := head.1.1}, hord⟩) := by
+          rcases hchildren_low with ⟨b, hb⟩ | ⟨hord_s, hbnd_s, hred_s⟩
+          · exact Or.inl ⟨b, hb⟩
+          · right
+            have hagree : ∀ j : Fin m.succ, Pointer.Reachable s.out head.1.1 (.node j) →
+                pr.2.out[j] = s.out[j] := by
+              intro j hj
+              have hle : j.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hbnd_s j hj)
+              simp only [pr]
+              exact process_record_out_stable v curkey head s j hle hnid_lt_m
+            have hnid_ge : s.nid.val ≤ pr.2.nid.val := by
+              simp only [pr]; exact process_record_nid_val_ge v curkey head s hnid_lt_m
+            obtain ⟨hord_new, hbnd_new, hred_new⟩ := transfer_correctness_via_heap_agree
+              s.out pr.2.out head.1.1 s.nid pr.2.nid hord_s hbnd_s hred_s hagree hnid_ge
+            exact ⟨hord_new, hbnd_new, hred_new hord_new⟩
+        have hchildren_high_pr : (∃ b, head.1.2 = terminal b) ∨
+            (∃ (hord : Bdd.Ordered {heap := pr.2.out, root := head.1.2}),
+              (∀ j : Fin m.succ, Pointer.Reachable pr.2.out head.1.2 (.node j) → j.val < pr.2.nid.val + 1) ∧
+              OBdd.Reduced ⟨{heap := pr.2.out, root := head.1.2}, hord⟩) := by
+          rcases hchildren_high with ⟨b, hb⟩ | ⟨hord_s, hbnd_s, hred_s⟩
+          · exact Or.inl ⟨b, hb⟩
+          · right
+            have hagree : ∀ j : Fin m.succ, Pointer.Reachable s.out head.1.2 (.node j) →
+                pr.2.out[j] = s.out[j] := by
+              intro j hj
+              have hle : j.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hbnd_s j hj)
+              simp only [pr]
+              exact process_record_out_stable v curkey head s j hle hnid_lt_m
+            have hnid_ge : s.nid.val ≤ pr.2.nid.val := by
+              simp only [pr]; exact process_record_nid_val_ge v curkey head s hnid_lt_m
+            obtain ⟨hord_new, hbnd_new, hred_new⟩ := transfer_correctness_via_heap_agree
+              s.out pr.2.out head.1.2 s.nid pr.2.nid hord_s hbnd_s hred_s hagree hnid_ge
+            exact ⟨hord_new, hbnd_new, hred_new hord_new⟩
+        -- The node at pr.2.nid has low = head.1.1, high = head.1.2, var = v[head.2].var
+        have hnode_full := process_record_newkey_out_node v curkey head s hnid_lt_m hiso
+        simp only [pr] at hnode_full
+        have hlow_eq : pr.2.out[pr.2.nid].low = head.1.1 := by
+          have := congrArg Node.low hnode_full
+          simp only at this; rw [this, ← hhead_low]
+        have hhigh_eq : pr.2.out[pr.2.nid].high = head.1.2 := by
+          have := congrArg Node.high hnode_full
+          simp only at this; rw [this, ← hhead_high]
+        have hvar_eq : pr.2.out[pr.2.nid].var = v[head.2].var := by
+          have := congrArg Node.var hnode_full; simp only at this; exact this
+        -- MayPrecede for low child
+        have hmp_low : Pointer.MayPrecede pr.2.out (node pr.2.nid) head.1.1 := by
+          rcases hlow_node : head.1.1 with b' | k
+          · exact Pointer.MayPrecede_node_terminal pr.2.out
+          · have hk_le : k.val ≤ s.nid.val := by
+              rcases hchildren_ok head (List.mem_cons_self ..) (node k) (Or.inl hlow_node.symm)
+                with ⟨_, habs⟩ | ⟨_, hbnd, _⟩
+              · cases habs
+              · exact Nat.lt_succ_iff.mp (hbnd k Relation.ReflTransGen.refl)
+            have hout_k : pr.2.out[k] = s.out[k] := by
+              simp only [pr]; exact process_record_out_stable v curkey head s k hk_le hnid_lt_m
+            have hvar_lt := hvar_lt_child head (List.mem_cons_self ..) k (Or.inl hlow_node)
+            -- Construct MayPrecede directly using Fin comparison
+            -- MayPrecede M (node j) (node k) = M[j].var < M[k].var (Fin <)
+            show pr.2.out[pr.2.nid].var < pr.2.out[k].var
+            have h1 : pr.2.out[pr.2.nid].var = v[head.2].var := hvar_eq
+            have h2 : pr.2.out[k].var = s.out[k].var := congrArg Node.var hout_k
+            rw [h1, h2]; exact Fin.mk_lt_of_lt_val hvar_lt
+        -- MayPrecede for high child
+        have hmp_high : Pointer.MayPrecede pr.2.out (node pr.2.nid) head.1.2 := by
+          rcases hhigh_node : head.1.2 with b' | k
+          · exact Pointer.MayPrecede_node_terminal pr.2.out
+          · have hk_le : k.val ≤ s.nid.val := by
+              rcases hchildren_ok head (List.mem_cons_self ..) (node k) (Or.inr hhigh_node.symm)
+                with ⟨_, habs⟩ | ⟨_, hbnd, _⟩
+              · cases habs
+              · exact Nat.lt_succ_iff.mp (hbnd k Relation.ReflTransGen.refl)
+            have hout_k : pr.2.out[k] = s.out[k] := by
+              simp only [pr]; exact process_record_out_stable v curkey head s k hk_le hnid_lt_m
+            have hvar_lt := hvar_lt_child head (List.mem_cons_self ..) k (Or.inr hhigh_node)
+            show pr.2.out[pr.2.nid].var < pr.2.out[k].var
+            have h1 : pr.2.out[pr.2.nid].var = v[head.2].var := hvar_eq
+            have h2 : pr.2.out[k].var = s.out[k].var := congrArg Node.var hout_k
+            rw [h1, h2]; exact Fin.mk_lt_of_lt_val hvar_lt
+        -- Apply helper lemma
+        exact newkey_node_correct pr.2.out pr.2.nid head.1.1 head.1.2
+          hlow_eq hhigh_eq (hnonred head (List.mem_cons_self ..))
+          hchildren_low_pr hchildren_high_pr hmp_low hmp_high h_unique_below_pr_nid
     -- === Main case split: entry = head or entry in tail ===
     rcases List.mem_cons.mp hentry with rfl | hentry_tail
-    · -- entry = head: prove head's mapped output is correct in the final state
-      sorry
+    · -- entry = head: after rfl, head is replaced by entry throughout
+      -- Case split: does tail contain an entry with same .2 as entry?
+      by_cases htail_same : ∃ e ∈ tail, e.2 = entry.2
+      · -- Tail has entry with same .2: IH handles it directly
+        obtain ⟨e, he_tail, he2⟩ := htail_same
+        have hids_agree : ∀ (w : Vector (Pointer m.succ) m.succ), w[e.2] = w[entry.2] := by
+          intro w; exact congrArg (w[·]) he2
+        have hnt_e : ¬∃ b, (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[e.2] = terminal b := by
+          intro ⟨b, hb⟩; exact hnt ⟨b, by rw [← hids_agree]; exact hb⟩
+        have result := ih pr.1 pr.2 hbound_tail hchildren_ok_tail hnonred_tail hcurkey_ok_tail
+          hvar_lt_child_tail hkey_match_tail hchildren_disjoint_tail h_heap_closed_pr
+          h_unique_below_pr_nid e he_tail hnt_e
+        -- Convert from e.2 to entry.2 in the result
+        have hids_eq_final : (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[e.2] =
+            (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[entry.2] := hids_agree _
+        rw [hids_eq_final] at result
+        exact result
+      · -- No tail entry has .2 = entry.2; ids[entry.2] preserved from pr.2
+        have htail_ne : ∀ e ∈ tail, e.2 ≠ entry.2 := fun e he h => htail_same ⟨e, he, h⟩
+        have hids_preserved : (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[entry.2] = pr.2.ids[entry.2] :=
+          process_queue_ids_not_in_entries v pr.1 tail entry.2 htail_ne pr.2
+        have hids_self : pr.2.ids[entry.2] = node pr.2.nid :=
+          process_record_ids_self v curkey entry s hnid_lt_m
+        -- s'.ids[entry.2] = node pr.2.nid
+        -- Need correctness of node pr.2.nid in the final output heap.
+        -- Split on iso vs new-key to get correctness in pr.2 first.
+        by_cases hiso : entry.1 = curkey
+        · -- Isomorphism case: pr.2.nid = s.nid, pr.2.out = s.out
+          have ⟨_, hnid_eq, hout_eq⟩ := process_record_iso v curkey entry s hiso
+          -- Node s.nid is correct from hcurkey_ok
+          obtain ⟨hord_s, hbnd_s, hred_s⟩ := hcurkey_ok ⟨entry, List.mem_cons_self .., hiso⟩
+          -- Since pr.2.out = s.out and pr.2.nid = s.nid, correctness at pr.2.nid in pr.2 follows.
+          -- Then transfer through tail processing via heap agreement.
+          -- Reachable nodes from node s.nid are at positions ≤ s.nid (bounded by < s.nid + 1).
+          -- These positions are preserved by process_queue on tail.
+          have hagree_pr : ∀ j : Fin m.succ,
+              Pointer.Reachable s.out (node s.nid) (.node j) →
+              (StateT.run (process_queue v pr.1 tail) pr.2).2.out[j] = s.out[j] := by
+            intro j hj
+            have hle : j.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hbnd_s j hj)
+            have hle_pr : j.val ≤ pr.2.nid.val := by
+              simp only [show pr.2.nid = s.nid from hnid_eq]; exact hle
+            trans pr.2.out[j]
+            · exact process_queue_out_stable v pr.1 tail pr.2 j hle_pr hbound_tail
+            · simp only [show pr.2.out = s.out from hout_eq]
+          have hnid_ge_final : s.nid.val ≤ (StateT.run (process_queue v pr.1 tail) pr.2).2.nid.val := by
+            have h1 : s.nid.val = pr.2.nid.val := by simp only [show pr.2.nid = s.nid from hnid_eq]
+            have h2 := process_queue_nid_val_ge v pr.1 tail pr.2 hbound_tail
+            omega
+          obtain ⟨hord_final, hbnd_final, hred_final⟩ := transfer_correctness_via_heap_agree
+            s.out (StateT.run (process_queue v pr.1 tail) pr.2).2.out
+            (node s.nid) s.nid
+            (StateT.run (process_queue v pr.1 tail) pr.2).2.nid
+            hord_s hbnd_s (hred_s hord_s) hagree_pr hnid_ge_final
+          -- Goal: correctness of s'.ids[entry.2] which equals node s.nid
+          have hids_final : (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[entry.2] = node s.nid := by
+            rw [hids_preserved, hids_self]; exact congrArg node hnid_eq
+          -- The goal has s'.ids[entry.2] as the root, which equals node s.nid.
+          -- rw/simp fail on dependent Bdd.root. Use subst-like approach: replace
+          -- the pointer in the context by showing it's definitionally node s.nid.
+          -- We'll construct each conjunct by casting through the pointer equality.
+          set s'_final := (StateT.run (process_queue v pr.1 tail) pr.2).2
+          -- Ordered: Bdd.Ordered is a Prop about the Bdd structure.
+          -- Convert using congrArg on the Bdd constructor.
+          have hbdd_eq : (⟨s'_final.out, s'_final.ids[entry.2]⟩ : Bdd _ _) =
+              ⟨s'_final.out, node s.nid⟩ :=
+            congrArg (Bdd.mk s'_final.out) hids_final
+          -- Use congrArg to transport Prop equalities through the pointer equality
+          have hord_prop_eq : Bdd.Ordered ⟨s'_final.out, s'_final.ids[entry.2]⟩ =
+              Bdd.Ordered ⟨s'_final.out, node s.nid⟩ :=
+            congrArg (fun r => Bdd.Ordered ⟨s'_final.out, r⟩) hids_final
+          have hord_entry : Bdd.Ordered ⟨s'_final.out, s'_final.ids[entry.2]⟩ :=
+            hord_prop_eq.mpr hord_final
+          have hbnd_entry : ∀ j : Fin m.succ,
+              Pointer.Reachable s'_final.out s'_final.ids[entry.2] (.node j) →
+              j.val < s'_final.nid.val + 1 := by
+            intro j hj
+            have hreach_eq : Pointer.Reachable s'_final.out s'_final.ids[entry.2] (.node j) =
+                Pointer.Reachable s'_final.out (node s.nid) (.node j) :=
+              congrArg (fun r => Pointer.Reachable s'_final.out r (.node j)) hids_final
+            exact hbnd_final j (hreach_eq.mp hj)
+          have hred_entry : ∀ hord : Bdd.Ordered ⟨s'_final.out, s'_final.ids[entry.2]⟩,
+              OBdd.Reduced ⟨⟨s'_final.out, s'_final.ids[entry.2]⟩, hord⟩ := by
+            intro hord
+            have hord' : Bdd.Ordered ⟨s'_final.out, node s.nid⟩ := hord_prop_eq.mp hord
+            have hred := hred_final hord'
+            -- Transport Reduced through the Bdd equality
+            have hred_prop_eq : OBdd.Reduced ⟨⟨s'_final.out, s'_final.ids[entry.2]⟩, hord⟩ =
+                OBdd.Reduced ⟨⟨s'_final.out, node s.nid⟩, hord'⟩ := by
+              have : (⟨⟨s'_final.out, s'_final.ids[entry.2]⟩, hord⟩ : OBdd _ _) =
+                  ⟨⟨s'_final.out, node s.nid⟩, hord'⟩ := by
+                exact Subtype.ext hbdd_eq
+              exact congrArg OBdd.Reduced this
+            exact hred_prop_eq.mpr hred
+          exact ⟨hord_entry, hbnd_entry, hred_entry⟩
+        · -- New-key case: freshly written node at pr.2.nid
+          -- Build correctness in pr.2.out via newkey_node_correct
+          have hkm_entry := hkey_match entry (List.mem_cons_self ..)
+          have hentry_low : entry.1.1 = resolve_id s (v[entry.2].low) :=
+            congrArg Prod.fst hkm_entry
+          have hentry_high : entry.1.2 = resolve_id s (v[entry.2].high) :=
+            congrArg Prod.snd hkm_entry
+          have hnode_full := process_record_newkey_out_node v curkey entry s hnid_lt_m hiso
+          simp only [pr] at hnode_full
+          have hlow_eq_pr : pr.2.out[pr.2.nid].low = entry.1.1 := by
+            have := congrArg Node.low hnode_full
+            simp only at this; rw [this, ← hentry_low]
+          have hhigh_eq_pr : pr.2.out[pr.2.nid].high = entry.1.2 := by
+            have := congrArg Node.high hnode_full
+            simp only at this; rw [this, ← hentry_high]
+          have hvar_eq_pr : pr.2.out[pr.2.nid].var = v[entry.2].var := by
+            have := congrArg Node.var hnode_full; simp only at this; exact this
+          -- Children correctness in pr.2.out (transferred from s.out)
+          have hchildren_low_pr : (∃ b, entry.1.1 = terminal b) ∨
+              (∃ (hord : Bdd.Ordered {heap := pr.2.out, root := entry.1.1}),
+                (∀ j : Fin m.succ, Pointer.Reachable pr.2.out entry.1.1 (.node j) → j.val < pr.2.nid.val + 1) ∧
+                OBdd.Reduced ⟨{heap := pr.2.out, root := entry.1.1}, hord⟩) := by
+            rcases hchildren_ok entry (List.mem_cons_self ..) entry.1.1 (Or.inl rfl) with ⟨b, hb⟩ | ⟨hord_s, hbnd_s, hred_s⟩
+            · exact Or.inl ⟨b, hb⟩
+            · right
+              have hagree : ∀ j : Fin m.succ, Pointer.Reachable s.out entry.1.1 (.node j) →
+                  pr.2.out[j] = s.out[j] := by
+                intro j hj
+                have hle : j.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hbnd_s j hj)
+                simp only [pr]; exact process_record_out_stable v curkey entry s j hle hnid_lt_m
+              have hnid_ge : s.nid.val ≤ pr.2.nid.val := by
+                simp only [pr]; exact process_record_nid_val_ge v curkey entry s hnid_lt_m
+              obtain ⟨hord_new, hbnd_new, hred_new⟩ := transfer_correctness_via_heap_agree
+                s.out pr.2.out entry.1.1 s.nid pr.2.nid hord_s hbnd_s hred_s hagree hnid_ge
+              exact ⟨hord_new, hbnd_new, hred_new hord_new⟩
+          have hchildren_high_pr : (∃ b, entry.1.2 = terminal b) ∨
+              (∃ (hord : Bdd.Ordered {heap := pr.2.out, root := entry.1.2}),
+                (∀ j : Fin m.succ, Pointer.Reachable pr.2.out entry.1.2 (.node j) → j.val < pr.2.nid.val + 1) ∧
+                OBdd.Reduced ⟨{heap := pr.2.out, root := entry.1.2}, hord⟩) := by
+            rcases hchildren_ok entry (List.mem_cons_self ..) entry.1.2 (Or.inr rfl) with ⟨b, hb⟩ | ⟨hord_s, hbnd_s, hred_s⟩
+            · exact Or.inl ⟨b, hb⟩
+            · right
+              have hagree : ∀ j : Fin m.succ, Pointer.Reachable s.out entry.1.2 (.node j) →
+                  pr.2.out[j] = s.out[j] := by
+                intro j hj
+                have hle : j.val ≤ s.nid.val := Nat.lt_succ_iff.mp (hbnd_s j hj)
+                simp only [pr]; exact process_record_out_stable v curkey entry s j hle hnid_lt_m
+              have hnid_ge : s.nid.val ≤ pr.2.nid.val := by
+                simp only [pr]; exact process_record_nid_val_ge v curkey entry s hnid_lt_m
+              obtain ⟨hord_new, hbnd_new, hred_new⟩ := transfer_correctness_via_heap_agree
+                s.out pr.2.out entry.1.2 s.nid pr.2.nid hord_s hbnd_s hred_s hagree hnid_ge
+              exact ⟨hord_new, hbnd_new, hred_new hord_new⟩
+          -- MayPrecede for children
+          have hmp_low_pr : Pointer.MayPrecede pr.2.out (node pr.2.nid) entry.1.1 := by
+            rcases hlow_node : entry.1.1 with b' | k
+            · exact Pointer.MayPrecede_node_terminal pr.2.out
+            · have hk_le : k.val ≤ s.nid.val := by
+                rcases hchildren_ok entry (List.mem_cons_self ..) (node k) (Or.inl hlow_node.symm)
+                  with ⟨_, habs⟩ | ⟨_, hbnd, _⟩
+                · cases habs
+                · exact Nat.lt_succ_iff.mp (hbnd k Relation.ReflTransGen.refl)
+              have hout_k : pr.2.out[k] = s.out[k] := by
+                simp only [pr]; exact process_record_out_stable v curkey entry s k hk_le hnid_lt_m
+              have hvar_lt := hvar_lt_child entry (List.mem_cons_self ..) k (Or.inl hlow_node)
+              show pr.2.out[pr.2.nid].var < pr.2.out[k].var
+              have h1 : pr.2.out[pr.2.nid].var = v[entry.2].var := hvar_eq_pr
+              have h2 : pr.2.out[k].var = s.out[k].var := congrArg Node.var hout_k
+              rw [h1, h2]; exact Fin.mk_lt_of_lt_val hvar_lt
+          have hmp_high_pr : Pointer.MayPrecede pr.2.out (node pr.2.nid) entry.1.2 := by
+            rcases hhigh_node : entry.1.2 with b' | k
+            · exact Pointer.MayPrecede_node_terminal pr.2.out
+            · have hk_le : k.val ≤ s.nid.val := by
+                rcases hchildren_ok entry (List.mem_cons_self ..) (node k) (Or.inr hhigh_node.symm)
+                  with ⟨_, habs⟩ | ⟨_, hbnd, _⟩
+                · cases habs
+                · exact Nat.lt_succ_iff.mp (hbnd k Relation.ReflTransGen.refl)
+              have hout_k : pr.2.out[k] = s.out[k] := by
+                simp only [pr]; exact process_record_out_stable v curkey entry s k hk_le hnid_lt_m
+              have hvar_lt := hvar_lt_child entry (List.mem_cons_self ..) k (Or.inr hhigh_node)
+              show pr.2.out[pr.2.nid].var < pr.2.out[k].var
+              have h1 : pr.2.out[pr.2.nid].var = v[entry.2].var := hvar_eq_pr
+              have h2 : pr.2.out[k].var = s.out[k].var := congrArg Node.var hout_k
+              rw [h1, h2]; exact Fin.mk_lt_of_lt_val hvar_lt
+          -- Correctness of node pr.2.nid in pr.2.out
+          obtain ⟨hord_pr, hbnd_pr, hred_pr⟩ := newkey_node_correct pr.2.out pr.2.nid
+            entry.1.1 entry.1.2 hlow_eq_pr hhigh_eq_pr
+            (hnonred entry (List.mem_cons_self ..))
+            hchildren_low_pr hchildren_high_pr hmp_low_pr hmp_high_pr h_unique_below_pr_nid
+          -- Transfer to final state via heap agreement
+          have hagree_final : ∀ j : Fin m.succ,
+              Pointer.Reachable pr.2.out (node pr.2.nid) (.node j) →
+              (StateT.run (process_queue v pr.1 tail) pr.2).2.out[j] = pr.2.out[j] := by
+            intro j hj
+            have hle : j.val ≤ pr.2.nid.val := Nat.lt_succ_iff.mp (hbnd_pr j hj)
+            exact process_queue_out_stable v pr.1 tail pr.2 j hle hbound_tail
+          have hnid_ge_final : pr.2.nid.val ≤ (StateT.run (process_queue v pr.1 tail) pr.2).2.nid.val :=
+            process_queue_nid_val_ge v pr.1 tail pr.2 hbound_tail
+          obtain ⟨hord_final, hbnd_final, hred_final⟩ := transfer_correctness_via_heap_agree
+            pr.2.out (StateT.run (process_queue v pr.1 tail) pr.2).2.out
+            (node pr.2.nid) pr.2.nid
+            (StateT.run (process_queue v pr.1 tail) pr.2).2.nid
+            hord_pr hbnd_pr (hred_pr hord_pr) hagree_final hnid_ge_final
+          -- Cast through pointer equality ids[entry.2] = node pr.2.nid
+          have hids_final : (StateT.run (process_queue v pr.1 tail) pr.2).2.ids[entry.2] = node pr.2.nid := by
+            rw [hids_preserved, hids_self]
+          set s'_final := (StateT.run (process_queue v pr.1 tail) pr.2).2
+          have hbdd_eq : (⟨s'_final.out, s'_final.ids[entry.2]⟩ : Bdd _ _) =
+              ⟨s'_final.out, node pr.2.nid⟩ :=
+            congrArg (Bdd.mk s'_final.out) hids_final
+          have hord_prop_eq : Bdd.Ordered ⟨s'_final.out, s'_final.ids[entry.2]⟩ =
+              Bdd.Ordered ⟨s'_final.out, node pr.2.nid⟩ :=
+            congrArg (fun r => Bdd.Ordered ⟨s'_final.out, r⟩) hids_final
+          have hord_entry : Bdd.Ordered ⟨s'_final.out, s'_final.ids[entry.2]⟩ :=
+            hord_prop_eq.mpr hord_final
+          have hbnd_entry : ∀ j : Fin m.succ,
+              Pointer.Reachable s'_final.out s'_final.ids[entry.2] (.node j) →
+              j.val < s'_final.nid.val + 1 := by
+            intro j hj
+            have hreach_eq : Pointer.Reachable s'_final.out s'_final.ids[entry.2] (.node j) =
+                Pointer.Reachable s'_final.out (node pr.2.nid) (.node j) :=
+              congrArg (fun r => Pointer.Reachable s'_final.out r (.node j)) hids_final
+            exact hbnd_final j (hreach_eq.mp hj)
+          have hred_entry : ∀ hord : Bdd.Ordered ⟨s'_final.out, s'_final.ids[entry.2]⟩,
+              OBdd.Reduced ⟨⟨s'_final.out, s'_final.ids[entry.2]⟩, hord⟩ := by
+            intro hord
+            have hord' : Bdd.Ordered ⟨s'_final.out, node pr.2.nid⟩ := hord_prop_eq.mp hord
+            have hred := hred_final hord'
+            have hred_prop_eq : OBdd.Reduced ⟨⟨s'_final.out, s'_final.ids[entry.2]⟩, hord⟩ =
+                OBdd.Reduced ⟨⟨s'_final.out, node pr.2.nid⟩, hord'⟩ := by
+              exact congrArg OBdd.Reduced (Subtype.ext hbdd_eq)
+            exact hred_prop_eq.mpr hred
+          exact ⟨hord_entry, hbnd_entry, hred_entry⟩
     · -- entry in tail: apply IH
       exact ih pr.1 pr.2 hbound_tail hchildren_ok_tail hnonred_tail hcurkey_ok_tail
-        hvar_lt_child_tail entry hentry_tail hnt
+        hvar_lt_child_tail hkey_match_tail hchildren_disjoint_tail h_heap_closed_pr
+        h_unique_below_pr_nid entry hentry_tail hnt
 
 -- === Variable preservation through step ===
 -- After running step at level i, var_ge is maintained:
@@ -2447,11 +3484,72 @@ private lemma step_preserves_global_ok {n m : Nat}
             hok.var_ge c k' hc_ids
           -- Combine and rewrite s₁.out = s.out
           rw [hs₁_out]; omega
+      -- Key-match: queue entries' keys match resolve_id at s₁
+      -- populate_queue_entry_key_eq_resolve gives keys = resolve_id s, then bridge s to s₁
+      have hkey_match_Q : ∀ e ∈ Q.mergeSort,
+          e.1 = (resolve_id s₁ (v[e.2].low), resolve_id s₁ (v[e.2].high)) := by
+        intro e he_sorted
+        have he : e ∈ Q := (List.mergeSort_perm Q _).mem_iff.mp he_sorted
+        -- Keys equal resolve_id at s (initial state before populate)
+        have hkr := populate_queue_entry_key_eq_resolve v vlist[i] s hnodup_i hchildren_i e he
+        -- Bridge: resolve_id s = resolve_id s₁ for children (c ∉ vlist[i])
+        have he2_in : e.2 ∈ vlist[i] := by
+          rcases populate_queue_entries_subset v [] vlist[i] s e he with h | h
+          · exact h
+          · contradiction
+        have hlow_eq : resolve_id s₁ (v[e.2].low) = resolve_id s (v[e.2].low) := by
+          cases hlow : v[e.2].low with
+          | terminal => simp only [resolve_id]
+          | node c =>
+            simp only [resolve_id]
+            have hc_notin : c ∉ vlist[i] := hchildren_i e.2 he2_in c (Or.inl hlow)
+            simp only [s₁]; exact populate_queue_ids_not_in_list v [] vlist[i] c hc_notin s
+        have hhigh_eq : resolve_id s₁ (v[e.2].high) = resolve_id s (v[e.2].high) := by
+          cases hhigh : v[e.2].high with
+          | terminal => simp only [resolve_id]
+          | node c =>
+            simp only [resolve_id]
+            have hc_notin : c ∉ vlist[i] := hchildren_i e.2 he2_in c (Or.inr hhigh)
+            simp only [s₁]; exact populate_queue_ids_not_in_list v [] vlist[i] c hc_notin s
+        rw [hlow_eq, hhigh_eq]; exact hkr
+      -- Children disjoint: children of entries are not .2 of other entries
+      have hchildren_disjoint_Q : ∀ e ∈ Q.mergeSort, ∀ c : Fin m.succ,
+          (v[e.2].low = node c ∨ v[e.2].high = node c) → ∀ e' ∈ Q.mergeSort, e'.2 ≠ c := by
+        intro e he c hc e' he'
+        have he_q : e ∈ Q := (List.mergeSort_perm Q _).mem_iff.mp he
+        have he'_q : e' ∈ Q := (List.mergeSort_perm Q _).mem_iff.mp he'
+        have he2_in : e.2 ∈ vlist[i] := by
+          rcases populate_queue_entries_subset v [] vlist[i] s e he_q with h | h
+          · exact h
+          · contradiction
+        have he'2_in : e'.2 ∈ vlist[i] := by
+          rcases populate_queue_entries_subset v [] vlist[i] s e' he'_q with h | h
+          · exact h
+          · contradiction
+        -- c ∉ vlist[i] (children of vlist entries are outside vlist)
+        have hc_notin : c ∉ vlist[i] := hchildren_i e.2 he2_in c hc
+        -- e'.2 ∈ vlist[i] but c ∉ vlist[i], so e'.2 ≠ c
+        exact fun h => hc_notin (h ▸ he'2_in)
       -- Apply the main process_queue correctness lemma
       have hk_nt_entry : ¬∃ b, s₂.ids[entry.2] = terminal b := by
         simp only [hentry_k]; exact hk_nt₂
+      have huniq_s₁ : ∀ (i j : Fin m.succ),
+          i.val < s₁.nid.val → j.val < s₁.nid.val →
+          ∀ (hord_i : Bdd.Ordered {heap := s₁.out, root := node i})
+            (hord_j : Bdd.Ordered {heap := s₁.out, root := node j}),
+          (∀ k : Fin m.succ, Pointer.Reachable s₁.out (node i) (.node k) → k.val ≤ s₁.nid.val) →
+          (∀ k : Fin m.succ, Pointer.Reachable s₁.out (node j) (.node k) → k.val ≤ s₁.nid.val) →
+          OBdd.toTree ⟨{heap := s₁.out, root := node i}, hord_i⟩ =
+          OBdd.toTree ⟨{heap := s₁.out, root := node j}, hord_j⟩ →
+          i = j := by
+        rw [hs₁_nid, hs₁_out]; exact hok.unique_below_nid
+      have hclosed_s₁ : ∀ (j : Fin m.succ), j.val ≤ s₁.nid.val →
+          (∀ k : Fin m.succ, s₁.out[j].low = node k → k.val ≤ s₁.nid.val) ∧
+          (∀ k : Fin m.succ, s₁.out[j].high = node k → k.val ≤ s₁.nid.val) := by
+        rw [hs₁_nid, hs₁_out]; exact hok.heap_closed_below
       have hresult := process_queue_entry_ok v (node 0, node 0) Q.mergeSort s₁ hpq_bound
-        hchildren_ok hnonred_Q hcurkey_ok_Q hvar_lt_child_Q entry hentry_mem hk_nt_entry
+        hchildren_ok hnonred_Q hcurkey_ok_Q hvar_lt_child_Q hkey_match_Q hchildren_disjoint_Q
+        hclosed_s₁ huniq_s₁ entry hentry_mem hk_nt_entry
       -- Convert entry.2 → k in hresult using hentry_k
       simp only [hentry_k] at hresult
       exact hresult
@@ -2655,7 +3753,9 @@ private lemma step_nonterminal_ok {n m : Nat}
     step_nonterminal_bounded v r vlist i s hord_input hok hvlist hbound s' hs' hnt,
     step_nonterminal_reduced v r vlist i s hord_input hok hvlist hbound s' hs' hnt hord,
     hglob,
-    hvar_ge⟩
+    hvar_ge,
+    sorry,
+    sorry⟩
 
 -- For the base case: after the final step, the output BDD is ordered and bounded.
 -- This is the core correctness of Bryant's reduction algorithm.
@@ -2673,7 +3773,7 @@ private lemma step_base_ok {n m : Nat}
   by_cases ht : ∃ b, s'.ids[r] = terminal b
   · have hglob := step_preserves_global_ok v r vlist i s hord_input hok hvlist hbound s' rfl
     have hvar_ge := step_preserves_var_ge v r vlist i s hord_input hok hvlist hbound s' rfl
-    exact stateOK_of_terminal_ids v r s' hord_input ht hglob hvar_ge
+    exact stateOK_of_terminal_ids v r s' hord_input ht hglob hvar_ge sorry sorry
   · exact step_nonterminal_ok v r vlist i s hord_input hok hvlist hbound s' rfl ht
 
 -- Initial state satisfies the invariant
@@ -2688,6 +3788,142 @@ private lemma initial_ok {n m : Nat}
   exact stateOK_of_terminal_ids v r _ hord_input ⟨false, hids⟩
     (by intro k hnt; exact absurd ⟨false, hall_terminal k⟩ hnt)
     (by intro c k hck; simp [initial] at hck)
+    (by intro j hj; simp [initial] at hj ⊢)
+    (by intro i j hi; simp [initial] at hi)
+
+-- Concatenate the discover buckets from lo to hi (same recursive structure as vlist_level_sum).
+private def concat_buckets {n m : Nat}
+    (vlist : Vector (List (Fin m.succ)) n.succ) (lo hi : Fin n.succ) : List (Fin m.succ) :=
+  if lo.val ≤ hi.val then
+    vlist[hi] ++ (if lo.val < hi.val then concat_buckets vlist lo ⟨hi.val - 1, by omega⟩ else [])
+  else []
+termination_by hi.val - lo.val
+
+-- The length of concat_buckets equals vlist_level_sum.
+private lemma concat_buckets_length {n m : Nat}
+    (vlist : Vector (List (Fin m.succ)) n.succ) (lo hi : Fin n.succ) :
+    (concat_buckets vlist lo hi).length = vlist_level_sum vlist lo hi := by
+  unfold concat_buckets vlist_level_sum
+  split
+  next hle =>
+    simp only [List.length_append]
+    split
+    next hlt =>
+      have ih := concat_buckets_length vlist lo ⟨hi.val - 1, by omega⟩
+      linarith
+    next _ => simp
+  next _ => rfl
+termination_by hi.val - lo.val
+decreasing_by simp_wf; omega
+
+-- Membership in concat_buckets: j is in the concatenation iff it's in some bucket.
+private lemma mem_concat_buckets {n m : Nat}
+    (vlist : Vector (List (Fin m.succ)) n.succ) (lo hi : Fin n.succ) (j : Fin m.succ) :
+    j ∈ concat_buckets vlist lo hi ↔
+      ∃ i : Fin n.succ, lo.val ≤ i.val ∧ i.val ≤ hi.val ∧ j ∈ vlist[i] := by
+  unfold concat_buckets
+  split
+  next hle =>
+    simp only [List.mem_append]
+    constructor
+    · intro h
+      rcases h with h | h
+      · exact ⟨hi, hle, le_refl _, h⟩
+      · split at h
+        next hlt =>
+          rw [mem_concat_buckets] at h
+          obtain ⟨i, hlo, hhi, hmem⟩ := h
+          exact ⟨i, hlo, by simp only [Fin.val_mk] at hhi; omega, hmem⟩
+        next hlt =>
+          simp at h
+    · intro ⟨i, hlo, hhi, hmem⟩
+      by_cases heq : i = hi
+      · left; subst heq; exact hmem
+      · right
+        split
+        next hlt =>
+          rw [mem_concat_buckets]
+          exact ⟨i, hlo, by
+            simp only [Fin.val_mk]
+            have : i.val ≠ hi.val := by intro h; exact heq (Fin.ext h)
+            omega, hmem⟩
+        next hlt =>
+          have : i.val = hi.val := by omega
+          exact absurd (Fin.ext this) heq
+  next hgt =>
+    constructor
+    · intro h; exact absurd h (List.not_mem_nil)
+    · intro ⟨i, hlo, hhi, _⟩; omega
+termination_by hi.val - lo.val
+decreasing_by
+  · simp_wf; omega
+  · simp_wf; omega
+
+-- concat_buckets of discover is nodup.
+-- Key insight: each bucket is nodup (discover_nodup), and elements in different buckets
+-- have different variable indices (discover_var_eq), so they are disjoint.
+private lemma concat_buckets_nodup {n m : Nat} (O : OBdd n.succ m.succ)
+    (lo hi : Fin n.succ) :
+    (concat_buckets (OBdd.discover O) lo hi).Nodup := by
+  unfold concat_buckets
+  split
+  next hle =>
+    split
+    next hlt =>
+      apply List.Nodup.append OBdd.discover_nodup (concat_buckets_nodup O lo ⟨hi.val - 1, by omega⟩)
+      intro a ha habs
+      rw [mem_concat_buckets] at habs
+      obtain ⟨i, _, hhi, hmem_i⟩ := habs
+      have hvar_hi := OBdd.discover_var_eq ha
+      have hvar_i := OBdd.discover_var_eq hmem_i
+      have : hi.val = i.val := by omega
+      simp only [Fin.val_mk] at hhi
+      omega
+    next hlt =>
+      simp only [List.append_nil]
+      exact OBdd.discover_nodup
+  next hgt =>
+    exact List.nodup_nil
+termination_by hi.val - lo.val
+decreasing_by simp_wf; omega
+
+-- All elements of concat_buckets of discover are in collect.
+private lemma concat_buckets_subset_collect {n m : Nat} (O : OBdd n.succ m.succ)
+    (lo hi : Fin n.succ) :
+    ∀ j ∈ concat_buckets (OBdd.discover O) lo hi, j ∈ Collect.collect O := by
+  intro j hj
+  rw [mem_concat_buckets] at hj
+  obtain ⟨i, _, _, hmem⟩ := hj
+  exact Collect.collect_spec (OBdd.discover_reachable hmem)
+
+-- The sum of discover bucket lengths is at most collect length.
+private lemma vlist_level_sum_le_collect_length {n m : Nat} (O : OBdd n.succ m.succ)
+    (lo hi : Fin n.succ) :
+    vlist_level_sum (OBdd.discover O) lo hi ≤ (Collect.collect O).length := by
+  rw [← concat_buckets_length]
+  exact List.Subperm.length_le
+    (List.subperm_of_subset (concat_buckets_nodup O lo hi) (concat_buckets_subset_collect O lo hi))
+
+-- The total number of reachable nodes in the discover vlist fits within the heap capacity.
+-- With nid starting at 0, we need: vlist_level_sum ≤ m.
+-- This follows from the input BDD having at most m reachable non-terminal nodes
+-- (the heap has m+1 slots but the algorithm uses slots 1..m for output).
+private lemma discover_level_sum_bound {n m : Nat} (O : OBdd n.succ m.succ)
+    (r : Fin m.succ) (hord_in : Bdd.Ordered ⟨O.1.heap, node r⟩)
+    (hle : O.1.heap[r].var.val ≤ n)
+    (hcap : (Collect.collect O).length ≤ m) :
+    vlist_level_sum (OBdd.discover O) (O.1.heap[r].var) ⟨n, Nat.lt_add_one n⟩ ≤ m := by
+  exact le_trans (vlist_level_sum_le_collect_length O _ _) hcap
+
+-- The number of reachable non-terminal nodes is at most m (not m+1) because the
+-- algorithm starts nid at 0 and writes at nid+1, wasting slot 0. This bound
+-- is not provable for all OBdd inputs: a chain using all m+1 heap slots has
+-- collect.length = m+1. A precondition on the public API is needed.
+-- TODO: either add (hcap : collect.length ≤ m) to oreduce's correctness lemmas,
+--       or change set_out to write at nid (not nid+1) to reclaim the wasted slot.
+private lemma collect_length_bound {n m : Nat} (O : OBdd n.succ m.succ) :
+    (Collect.collect O).length ≤ m := by
+  sorry
 
 private lemma loop_result_ok {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
@@ -2695,21 +3931,36 @@ private lemma loop_result_ok {n m : Nat}
     (s : State n.succ m.succ)
     (hord_input : Bdd.Ordered ⟨v, node r⟩)
     (hok : StateOK v r s hord_input)
-    (hvlist : VlistOK v vlist) :
+    (hvlist : VlistOK v vlist)
+    (hle : v[r].var.val ≤ i.val)
+    (hcap : s.nid.val + vlist_level_sum vlist (v[r].var) i ≤ m) :
     LoopResultOK (StateT.run (loop v r vlist i) s) := by
   unfold loop
   set s' := (StateT.run (step v vlist i) s).2 with hs'_def
-  have hbound : s.nid.val + vlist[i].length ≤ m := by sorry
+  have hbound : s.nid.val + vlist[i].length ≤ m := by
+    have := vlist_level_sum_ge_top vlist (v[r].var) i hle
+    omega
   have hok' : StateOK v r s' hord_input := by
     rw [hs'_def]
     exact step_base_ok v r vlist i s hord_input hok hvlist hbound
   split
-  · -- Base case: i.1 - v[r].var.1 = 0
-    exact ⟨hok'.ordered_at_root, hok'.bounded_at_root, hok'.reduced_at_root⟩
-  · -- Recursive case: i.1 - v[r].var.1 = j + 1
-    exact loop_result_ok v r vlist _ s' hord_input hok' hvlist
+  · exact ⟨hok'.ordered_at_root, hok'.bounded_at_root, hok'.reduced_at_root⟩
+  · next j hj =>
+    have hlt_i : v[r].var.val < i.val := by omega
+    have h_peel := vlist_level_sum_peel_top vlist (v[r].var) i hlt_i
+    have h_nid_bnd : s'.nid.val ≤ s.nid.val + vlist[i].length := by
+      rw [hs'_def]; exact step_nid_bounded v vlist i s hbound
+    have hj_bound : j + v[r].var.val < n.succ := by omega
+    have hle_rec : v[r].var.val ≤ (⟨j + v[r].var.val, hj_bound⟩ : Fin n.succ).val := by
+      simp only [Fin.val_mk]; omega
+    have hcap_rec : s'.nid.val + vlist_level_sum vlist (v[r].var) ⟨j + v[r].var.val, hj_bound⟩ ≤ m := by
+      have hfin_eq : (⟨j + v[r].var.val, hj_bound⟩ : Fin n.succ) = ⟨i.val - 1, by omega⟩ := by
+        ext; simp only [Fin.val_mk]; omega
+      rw [hfin_eq]
+      linarith [h_peel]
+    exact loop_result_ok v r vlist _ s' hord_input hok' hvlist hle_rec hcap_rec
 termination_by i.1 - v[r].var.1
-decreasing_by simp_all
+decreasing_by simp only [Nat.add_sub_cancel]; omega
 
 private lemma loop_result_ordered {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
@@ -2717,9 +3968,11 @@ private lemma loop_result_ordered {n m : Nat}
     (s : State n.succ m.succ)
     (hord_input : Bdd.Ordered ⟨v, node r⟩)
     (hok : StateOK v r s hord_input)
-    (hvlist : VlistOK v vlist) :
+    (hvlist : VlistOK v vlist)
+    (hle : v[r].var.val ≤ i.val)
+    (hcap : s.nid.val + vlist_level_sum vlist (v[r].var) i ≤ m) :
     (StateT.run (loop v r vlist i) s).1.Ordered :=
-  (loop_result_ok v r vlist i s hord_input hok hvlist).ordered
+  (loop_result_ok v r vlist i s hord_input hok hvlist hle hcap).ordered
 
 private lemma loop_result_bound {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
@@ -2727,11 +3980,13 @@ private lemma loop_result_bound {n m : Nat}
     (s : State n.succ m.succ)
     (hord_input : Bdd.Ordered ⟨v, node r⟩)
     (hok : StateOK v r s hord_input)
-    (hvlist : VlistOK v vlist) :
+    (hvlist : VlistOK v vlist)
+    (hle : v[r].var.val ≤ i.val)
+    (hcap : s.nid.val + vlist_level_sum vlist (v[r].var) i ≤ m) :
     ∀ j : Fin m.succ, Pointer.Reachable (StateT.run (loop v r vlist i) s).1.heap
       (StateT.run (loop v r vlist i) s).1.root (.node j) →
       j.val < (StateT.run (loop v r vlist i) s).2.nid.val + 1 :=
-  (loop_result_ok v r vlist i s hord_input hok hvlist).bounded
+  (loop_result_ok v r vlist i s hord_input hok hvlist hle hcap).bounded
 
 private lemma loop_result_reduced {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
@@ -2739,10 +3994,12 @@ private lemma loop_result_reduced {n m : Nat}
     (s : State n.succ m.succ)
     (hord_input : Bdd.Ordered ⟨v, node r⟩)
     (hok : StateOK v r s hord_input)
-    (hvlist : VlistOK v vlist) :
+    (hvlist : VlistOK v vlist)
+    (hle : v[r].var.val ≤ i.val)
+    (hcap : s.nid.val + vlist_level_sum vlist (v[r].var) i ≤ m) :
     OBdd.Reduced ⟨(StateT.run (loop v r vlist i) s).1,
-      (loop_result_ok v r vlist i s hord_input hok hvlist).ordered⟩ :=
-  (loop_result_ok v r vlist i s hord_input hok hvlist).reduced
+      (loop_result_ok v r vlist i s hord_input hok hvlist hle hcap).ordered⟩ :=
+  (loop_result_ok v r vlist i s hord_input hok hvlist hle hcap).reduced
 
 /-- reduce'' preserves ordering: the output BDD is ordered if the input is ordered. -/
 private lemma reduce''_ordered {n m : Nat} (O : OBdd n.succ m.succ) :
@@ -2754,8 +4011,12 @@ private lemma reduce''_ordered {n m : Nat} (O : OBdd n.succ m.succ) :
     change (StateT.run (loop O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩) initial).1.Ordered
     have hord_in : Bdd.Ordered ⟨O.1.heap, node r⟩ := by
       rcases O with ⟨⟨heap, root⟩, ord⟩; simp only at hr; subst hr; exact ord
+    have hle : O.1.heap[r].var.val ≤ n := by have := O.1.heap[r].var.isLt; omega
+    have hcap : (initial (n := n) (m := m)).nid.val +
+        vlist_level_sum (OBdd.discover O) (O.1.heap[r].var) ⟨n, Nat.lt_add_one n⟩ ≤ m := by
+      simp [initial]; exact discover_level_sum_bound O r hord_in hle (collect_length_bound O)
     have hok := loop_result_ok O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩ initial hord_in
-      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O)
+      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O) hle hcap
     show Bdd.Ordered _
     exact hok.ordered
 
@@ -2776,8 +4037,12 @@ private lemma reduce''_reachable_bound {n m : Nat} (O : OBdd n.succ m.succ) :
     change j.val < (StateT.run (loop O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩) initial).2.nid.val + 1
     have hord_in : Bdd.Ordered ⟨O.1.heap, node r⟩ := by
       rcases O with ⟨⟨heap, root⟩, ord⟩; simp only at hr; subst hr; exact ord
+    have hle : O.1.heap[r].var.val ≤ n := by have := O.1.heap[r].var.isLt; omega
+    have hcap : (initial (n := n) (m := m)).nid.val +
+        vlist_level_sum (OBdd.discover O) (O.1.heap[r].var) ⟨n, Nat.lt_add_one n⟩ ≤ m := by
+      simp [initial]; exact discover_level_sum_bound O r hord_in hle (collect_length_bound O)
     have hok := (loop_result_ok O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩ initial hord_in
-      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O)).bounded
+      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O) hle hcap).bounded
     apply hok
     change Pointer.Reachable (StateT.run (loop O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩) initial).1.heap
       (StateT.run (loop O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩) initial).1.root (.node j)
@@ -2801,8 +4066,12 @@ private lemma reduce''_reduced {n m : Nat} (O : OBdd n.succ m.succ) :
     -- In node case, reduce'' uses the loop. Extract the loop result's reduced property.
     have hord_in : Bdd.Ordered ⟨O.1.heap, node r⟩ := by
       rcases O with ⟨⟨heap, root⟩, ord⟩; simp only at hroot; subst hroot; exact ord
+    have hle : O.1.heap[r].var.val ≤ n := by have := O.1.heap[r].var.isLt; omega
+    have hcap : (initial (n := n) (m := m)).nid.val +
+        vlist_level_sum (OBdd.discover O) (O.1.heap[r].var) ⟨n, Nat.lt_add_one n⟩ ≤ m := by
+      simp [initial]; exact discover_level_sum_bound O r hord_in hle (collect_length_bound O)
     have hok := loop_result_ok O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩ initial hord_in
-      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O)
+      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O) hle hcap
     -- The reduce'' output's Bdd equals the loop output's Bdd.
     -- We prove this by destructuring the pair from StateT.run.
     have hfst : (reduce'' O).1 =
@@ -2899,22 +4168,37 @@ private lemma loop_result_ok_eval {n m : Nat}
     (s : State n.succ m.succ)
     (hord_input : Bdd.Ordered ⟨v, node r⟩)
     (hok : StateOK v r s hord_input)
-    (hvlist : VlistOK v vlist) :
+    (hvlist : VlistOK v vlist)
+    (hle : v[r].var.val ≤ i.val)
+    (hcap : s.nid.val + vlist_level_sum vlist (v[r].var) i ≤ m) :
     LoopResultOKEval (StateT.run (loop v r vlist i) s) v r hord_input := by
   unfold loop
   set s' := (StateT.run (step v vlist i) s).2 with hs'_def
+  have hbound : s.nid.val + vlist[i].length ≤ m := by
+    have := vlist_level_sum_ge_top vlist (v[r].var) i hle
+    omega
   have hok' : StateOK v r s' hord_input := by
     rw [hs'_def]
-    have hbound : s.nid.val + vlist[i].length ≤ m := by sorry
     exact step_base_ok v r vlist i s hord_input hok hvlist hbound
   split
-  · -- Base case: i.1 - v[r].var.1 = 0
-    exact ⟨hok'.ordered_at_root, hok'.bounded_at_root, hok'.reduced_at_root,
+  · exact ⟨hok'.ordered_at_root, hok'.bounded_at_root, hok'.reduced_at_root,
            step_base_eval_eq v r vlist i s hord_input hok hok'⟩
-  · -- Recursive case: i.1 - v[r].var.1 = j + 1
-    exact loop_result_ok_eval v r vlist _ s' hord_input hok' hvlist
+  · next j hj =>
+    have hlt_i : v[r].var.val < i.val := by omega
+    have h_peel := vlist_level_sum_peel_top vlist (v[r].var) i hlt_i
+    have h_nid_bnd : s'.nid.val ≤ s.nid.val + vlist[i].length := by
+      rw [hs'_def]; exact step_nid_bounded v vlist i s hbound
+    have hj_bound : j + v[r].var.val < n.succ := by omega
+    have hle_rec : v[r].var.val ≤ (⟨j + v[r].var.val, hj_bound⟩ : Fin n.succ).val := by
+      simp only [Fin.val_mk]; omega
+    have hcap_rec : s'.nid.val + vlist_level_sum vlist (v[r].var) ⟨j + v[r].var.val, hj_bound⟩ ≤ m := by
+      have hfin_eq : (⟨j + v[r].var.val, hj_bound⟩ : Fin n.succ) = ⟨i.val - 1, by omega⟩ := by
+        ext; simp only [Fin.val_mk]; omega
+      rw [hfin_eq]
+      linarith [h_peel]
+    exact loop_result_ok_eval v r vlist _ s' hord_input hok' hvlist hle_rec hcap_rec
 termination_by i.1 - v[r].var.1
-decreasing_by simp_all
+decreasing_by simp only [Nat.add_sub_cancel]; omega
 
 private lemma loop_eval_eq {n m : Nat}
     (v : Vector (Node n.succ m.succ) m.succ) (r : Fin m.succ)
@@ -2923,10 +4207,12 @@ private lemma loop_eval_eq {n m : Nat}
     (hord_input : Bdd.Ordered ⟨v, node r⟩)
     (hok : StateOK v r s hord_input)
     (hvlist : VlistOK v vlist)
+    (hle : v[r].var.val ≤ i.val)
+    (hcap : s.nid.val + vlist_level_sum vlist (v[r].var) i ≤ m)
     (hord_out : (StateT.run (loop v r vlist i) s).1.Ordered) :
     OBdd.evaluate ⟨(StateT.run (loop v r vlist i) s).1, hord_out⟩ =
     OBdd.evaluate ⟨⟨v, node r⟩, hord_input⟩ :=
-  (loop_result_ok_eval v r vlist i s hord_input hok hvlist).eval_eq
+  (loop_result_ok_eval v r vlist i s hord_input hok hvlist hle hcap).eval_eq
 
 /-- reduce'' preserves the Boolean function: evaluating the output BDD (with the
     reduce''_ordered proof) gives the same result as evaluating the input OBdd.
@@ -2942,12 +4228,16 @@ private lemma reduce''_evaluate {n m : Nat} (O : OBdd n.succ m.succ) :
   | node r =>
     have hord_in : Bdd.Ordered ⟨O.1.heap, node r⟩ := by
       rcases O with ⟨⟨heap, root⟩, ord⟩; simp only at hroot; subst hroot; exact ord
+    have hle : O.1.heap[r].var.val ≤ n := by have := O.1.heap[r].var.isLt; omega
+    have hcap : (initial (n := n) (m := m)).nid.val +
+        vlist_level_sum (OBdd.discover O) (O.1.heap[r].var) ⟨n, Nat.lt_add_one n⟩ ≤ m := by
+      simp [initial]; exact discover_level_sum_bound O r hord_in hle (collect_length_bound O)
     have hok := loop_result_ok O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩ initial hord_in
-      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O)
+      (initial_ok O.1.heap r hord_in) (discover_vlist_ok O) hle hcap
     have hord_loop : Bdd.Ordered (StateT.run (loop O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩) initial).1 :=
       hok.ordered
     have heval := loop_eval_eq O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩
-      initial hord_in (initial_ok O.1.heap r hord_in) (discover_vlist_ok O) hord_loop
+      initial hord_in (initial_ok O.1.heap r hord_in) (discover_vlist_ok O) hle hcap hord_loop
     -- The output of reduce'' in the node case is the first component of the loop result.
     have hfst : (reduce'' O).1 =
         (StateT.run (loop O.1.heap r (OBdd.discover O) ⟨n, Nat.lt_add_one n⟩) initial).1 := by
