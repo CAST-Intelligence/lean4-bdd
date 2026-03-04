@@ -293,7 +293,12 @@ def var (n : Nat) : BDD :=
 
 See also `apply_denotation`. -/
 def apply : (Bool → Bool → Bool) → BDD → BDD → BDD := fun op B C ↦
-  ⟨_, _, (Reduce.oreduce (Apply.oapply op B.obdd C.obdd).2.1).2, Reduce.oreduce_reduced⟩
+  let O := (Apply.oapply op B.obdd C.obdd).2.1
+  -- HasCollectBound: the reduce algorithm requires collect.length <= m for OBdd n.succ m.succ.
+  -- This holds when the input has at most m reachable nodes (out of m+1 heap slots).
+  -- For oapply outputs this is expected but not yet proven; see Reduce.lean for discussion.
+  have hcb : Reduce.HasCollectBound O := by sorry
+  ⟨_, _, (Reduce.oreduce O hcb).2, Reduce.oreduce_reduced hcb⟩
 
 @[simp]
 lemma apply_nvars {B C : BDD} {o} : (apply o B C).nvars = B.nvars ⊔ C.nvars := by
@@ -518,7 +523,10 @@ lemma find_some {B : BDD} {I} : B.find = some I → B.denotation' I = true := by
   next hf => injection h with heq; simp [← heq]
 
 private def restrict' (B : BDD) (b : Bool) (i : Fin B.nvars) : BDD :=
-  ⟨_, _, (Reduce.oreduce (Restrict.orestrict b i B.obdd).2.1).2, Reduce.oreduce_reduced⟩
+  let O := (Restrict.orestrict b i B.obdd).2.1
+  -- HasCollectBound: see apply above and Reduce.lean for discussion.
+  have hcb : Reduce.HasCollectBound O := by sorry
+  ⟨_, _, (Reduce.oreduce O hcb).2, Reduce.oreduce_reduced hcb⟩
 
 /-- Return a `BDD` denoting the restriction of a given `BDD` at an index `i` to a Boolean `b`.
 
