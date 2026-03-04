@@ -1,4 +1,5 @@
 import Bdd.Reduce
+import Bdd.GrowHeap
 import Bdd.Apply
 import Bdd.Relabel
 import Bdd.Choice
@@ -294,11 +295,9 @@ def var (n : Nat) : BDD :=
 See also `apply_denotation`. -/
 def apply : (Bool → Bool → Bool) → BDD → BDD → BDD := fun op B C ↦
   let O := (Apply.oapply op B.obdd C.obdd).2.1
-  -- HasCollectBound: the reduce algorithm requires collect.length <= m for OBdd n.succ m.succ.
-  -- This holds when the input has at most m reachable nodes (out of m+1 heap slots).
-  -- For oapply outputs this is expected but not yet proven; see Reduce.lean for discussion.
-  have hcb : Reduce.HasCollectBound O := by sorry
-  ⟨_, _, (Reduce.oreduce O hcb).2, Reduce.oreduce_reduced hcb⟩
+  let O' := (GrowHeap.OBdd.ensureBound O).2
+  have hcb : Reduce.HasCollectBound O' := GrowHeap.ensureBound_hasCollectBound O
+  ⟨_, _, (Reduce.oreduce O' hcb).2, Reduce.oreduce_reduced hcb⟩
 
 @[simp]
 lemma apply_nvars {B C : BDD} {o} : (apply o B C).nvars = B.nvars ⊔ C.nvars := by
@@ -351,7 +350,7 @@ lemma apply_denotation' {B C : BDD} {op} I :
   unfold apply
   generalize he : (apply op B C) = e
   unfold apply at he
-  simp only [denotation, Evaluate.evaluate_evaluate, lift, Lift.olift_evaluate, Reduce.oreduce_evaluate]
+  simp only [denotation, Evaluate.evaluate_evaluate, lift, Lift.olift_evaluate, Reduce.oreduce_evaluate, GrowHeap.ensureBound_evaluate]
   calc _
     _ = (Apply.oapply op (BDD.obdd B) (BDD.obdd C)).2.1.evaluate I := by simp
   exact (Apply.oapply op (BDD.obdd B) (BDD.obdd C)).2.2 I
@@ -524,9 +523,9 @@ lemma find_some {B : BDD} {I} : B.find = some I → B.denotation' I = true := by
 
 private def restrict' (B : BDD) (b : Bool) (i : Fin B.nvars) : BDD :=
   let O := (Restrict.orestrict b i B.obdd).2.1
-  -- HasCollectBound: see apply above and Reduce.lean for discussion.
-  have hcb : Reduce.HasCollectBound O := by sorry
-  ⟨_, _, (Reduce.oreduce O hcb).2, Reduce.oreduce_reduced hcb⟩
+  let O' := (GrowHeap.OBdd.ensureBound O).2
+  have hcb : Reduce.HasCollectBound O' := GrowHeap.ensureBound_hasCollectBound O
+  ⟨_, _, (Reduce.oreduce O' hcb).2, Reduce.oreduce_reduced hcb⟩
 
 /-- Return a `BDD` denoting the restriction of a given `BDD` at an index `i` to a Boolean `b`.
 
@@ -560,7 +559,7 @@ lemma restrict_denotation {B : BDD} {I : Vector Bool n} {i} {hi : i < n} {h} :
   split
   next hlt =>
     simp only [restrict', denotation, lift, evaluate, Evaluate.evaluate_evaluate, Lift.olift_evaluate]
-    simp only [Reduce.oreduce_evaluate]
+    simp only [Reduce.oreduce_evaluate, GrowHeap.ensureBound_evaluate]
     have := (Restrict.orestrict b ⟨i, hlt⟩ (BDD.obdd B)).2.2
     rw [this]
     simp only [Nary.restrict, Vector.take_eq_extract, Lift.olift_evaluate]
