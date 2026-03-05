@@ -5,21 +5,29 @@ implementation and formalization in Lean 4.
 
 ## Status
 
-The library is ready for use, but there is one file that is still not
-`sorry`-free, as indicated by the red circle in the following
-file-level dependencies graph of the library:
+**0 sorry across all files.** All proofs are kernel-verified. Axiom
+audit confirms only `propext`, `Classical.choice`, and `Quot.sound`
+(no `sorryAx`).
+
+> **CAST fork note (2026-03):** This fork
+> ([CAST-Intelligence/lean4-bdd](https://github.com/CAST-Intelligence/lean4-bdd))
+> ports the library to Lean 4.28.0 and closes all remaining sorry holes
+> in `Reduce.lean` and `BDD.lean` (Bryant reduction proofs). The
+> original upstream is [eshelyaron/lean4-bdd](https://github.com/eshelyaron/lean4-bdd).
+
+File-level dependency graph:
 
 ![Dependency graph](./dependencies.svg)
 
 ## Usage
 
-To use this library in you project, add something like the following
+To use this library in your project, add something like the following
 to your `lakefile.toml` file:
 
 ```toml
 [[require]]
 name = "bdd"
-git = "https://github.com/eshelyaron/lean4-bdd"
+git = "https://github.com/CAST-Intelligence/lean4-bdd"
 rev = "main"
 ```
 

@@ -12,3 +12,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: leanprover/lean-action@v1
+
+      - name: Check for sorry in source
+        run: |
+          if grep -rn '\bsorry\b' Bdd/ --include='*.lean'; then
+            echo "FAIL: sorry found in source files"
+            exit 1
+          else
+            echo "PASS: no sorry in source files"
+          fi
